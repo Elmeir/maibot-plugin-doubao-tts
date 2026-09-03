@@ -1,0 +1,4 @@
+# 豆包语音（Doubao TTS）运行依赖
+# 麦麦会根据 _manifest.json 的 dependencies 自动安装；本文件为手动安装兜底。
+# 安装：pip install -r requirements.txt
+aiohttp>=3.8.0
