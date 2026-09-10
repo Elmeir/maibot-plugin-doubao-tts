@@ -2,12 +2,12 @@
 
 > 让麦麦把文字变成语音说出口——调用**火山引擎·豆包语音合成大模型**（新版控制台鉴权），内置官方预置音色库，也支持你自己的复刻音色。
 
-- 插件 ID：`github.ZhaoCang-QWQ.doubao-tts`
+- 插件 ID：`github.elmeir.doubao-tts`
 - 版本：1.4.0
 - 类型：扩展插件
 - 最低麦麦版本：1.2.0（使用 maibot-plugin-sdk v2）
 - 依赖：`aiohttp`（≥3.8.0，自动安装）
-- 作者：昭沧QWQ（ZhaoCang-QWQ）
+- 作者：Elmeir（fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)）
 - License：MIT
 
 ---
@@ -158,6 +158,7 @@ emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下�
 
 ## 九、致谢
 
+- 本插件 fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)，在其基础上继续维护，感谢原作者的工作。
 - 参考了靓仔开发的 [xuqian13/tts_voice_plugin](https://github.com/xuqian13/tts_voice_plugin)（多后端 TTS 插件）的功能组织思路，本插件聚焦豆包语音单一后端、精简为新版控制台鉴权。
 
 ## 十、卸载

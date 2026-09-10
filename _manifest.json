@@ -1,17 +1,19 @@
 {
   "manifest_version": 2,
   "version": "1.4.6",
-  "id": "github.ZhaoCang-QWQ.doubao-tts",
+  "id": "github.elmeir.doubao-tts",
   "name": "豆包语音TTS（上下文修复版）",
   "description": "麦麦语音回复：调用火山引擎豆包语音合成大模型把文字变语音。内置官方预置音色库，也支持复刻音色；若 /说 后收到的是文字而非语音，通常是音色与资源不匹配（复刻音色须配 seed-icl-2.0，预置音色配 seed-tts-2.0）。新版 X-Api-Key 鉴权，无需旧版 App ID。",
   "author": {
-    "name": "昭沧QWQ",
-    "url": "https://github.com/ZhaoCang-QWQ"
+    "name": "Elmeir",
+    "url": "https://github.com/Elmeir"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/ZhaoCang-QWQ/doubao-tts",
-    "homepage": "https://github.com/ZhaoCang-QWQ/doubao-tts"
+    "repository": "https://github.com/Elmeir/doubao-tts",
+    "homepage": "https://github.com/Elmeir/doubao-tts",
+    "documentation": "https://github.com/Elmeir/doubao-tts#readme",
+    "issues": "https://github.com/Elmeir/doubao-tts/issues"
   },
   "host_application": {
     "min_version": "1.2.0",
