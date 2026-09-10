@@ -12,11 +12,13 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import random
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import aiohttp
@@ -124,7 +126,7 @@ class PluginSectionConfig(PluginConfigBase):
     enabled: bool = Field(
         default=True,
         description="是否启用插件（总开关；关闭=插件彻底卸载、命令消失）",
-        json_schema_extra={"label": "插件总开关"},
+        json_schema_extra={"label": "插件总开关", "hint": "关掉 = 整个插件卸载，语音功能与命令全部消失"},
     )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
@@ -143,7 +145,7 @@ class DoubaoSectionConfig(PluginConfigBase):
     api_key: str = Field(
         default="",
         description="火山引擎新版控制台 API Key（控制台→豆包语音→API Key 管理）。敏感信息，勿随插件分发",
-        json_schema_extra={"label": "API Key", "secret": True},
+        json_schema_extra={"label": "API Key", "secret": True, "hint": "火山引擎新版控制台 → 豆包语音 → API Key 管理；敏感信息，勿外传"},
     )
     resource_id: str = Field(
         default=DOUBAO_RESOURCE_PRESET,
@@ -210,6 +212,7 @@ class VoiceToneSectionConfig(PluginConfigBase):
                 "播音": {"label": "播音", "description": "字正腔圆的播音腔"},
                 "讲故事": {"label": "讲故事", "description": "娓娓道来、适合朗读故事"},
             },
+            "hint": "固定情感（默认“无”）；行为页「情感来源」设为 auto 时，麦麦自主语音会自己挑",
         },
     )
     emotion_scale: float = Field(
@@ -217,7 +220,7 @@ class VoiceToneSectionConfig(PluginConfigBase):
         ge=1.0,
         le=5.0,
         description="情感强度 1~5（配合情感使用，1=最淡）。若行为页 emotion_scale_mode=auto，麦麦自主时由 LLM 按情感挑",
-        json_schema_extra={"label": "情感强度（可自主）"},
+        json_schema_extra={"label": "情感强度（可自主）", "hint": "1~5，1=最淡；行为页「情感强度来源」设为 auto 时麦麦自己挑"},
     )
 
 
@@ -231,12 +234,12 @@ class SpeedLoudSectionConfig(PluginConfigBase):
     speech_rate: float = Field(
         default=0.0,
         description="语速 -50~100（0=正常）。火山固定连续数值，麦麦不可自主，仅手动设置",
-        json_schema_extra={"label": "语速（仅手动）"},
+        json_schema_extra={"label": "语速（仅手动）", "hint": "-50~100，0=正常；此值麦麦不能自主调节"},
     )
     loudness: float = Field(
         default=0.0,
         description="音量 -50~100（0=正常）。火山固定连续数值，麦麦不可自主，仅手动设置",
-        json_schema_extra={"label": "音量（仅手动）"},
+        json_schema_extra={"label": "音量（仅手动）", "hint": "-50~100，0=正常；此值麦麦不能自主调节"},
     )
 
 
@@ -249,8 +252,11 @@ class BehaviorSectionConfig(PluginConfigBase):
 
     command_enabled: bool = Field(
         default=True,
-        description="是否启用 /说 /语音 手动命令",
-        json_schema_extra={"label": "手动命令"},
+        description=(
+            "是否启用 /说 /语音 手动命令。"
+            "只影响手动命令；麦麦自主语音由「自主语音方式」（auto_voice_mode）控制"
+        ),
+        json_schema_extra={"label": "手动命令", "hint": "只影响 /说 /语音 手动命令；麦麦自主语音由下方「自主语音方式」控制"},
     )
     auto_voice_mode: Literal["llm", "probability", "off"] = Field(
         default="llm",
@@ -262,12 +268,13 @@ class BehaviorSectionConfig(PluginConfigBase):
                 "probability": {"label": "概率触发", "description": "麦麦不靠判断，每收一条消息按概率掷骰，命中则本轮回复转语音（频率由下方概率值精确控制）"},
                 "off": {"label": "关闭（仅手动）", "description": "麦麦从不主动语音，只有 /说 /语音 命令才会发声"},
             },
+            "hint": "llm=麦麦自己决定何时语音｜probability=每条消息掷骰，命中则回复转语音｜off=仅手动 /说",
         },
     )
     auto_voice_probability: float = Field(
         default=0.1,
         description="概率模式的触发概率 0~1（0.1=平均每 10 轮约 1 轮语音；0=关）。仅 auto_voice_mode=probability 时生效",
-        json_schema_extra={"label": "语音概率"},
+        json_schema_extra={"label": "语音概率", "hint": "0~1；0.1=平均每 10 轮约 1 轮语音，仅「概率触发」模式下生效"},
     )
     emotion_mode: Literal["fixed", "auto"] = Field(
         default="fixed",
@@ -278,6 +285,7 @@ class BehaviorSectionConfig(PluginConfigBase):
                 "fixed": {"label": "固定（手动设置）", "description": "始终用上方 [doubao] emotion 的值"},
                 "auto": {"label": "麦麦自主", "description": "麦麦自主语音（llm 模式）时由 LLM 结合氛围现场挑"},
             },
+            "hint": "fixed=手动 /说 用上方固定情感｜auto=麦麦自主语音时自己挑情感",
         },
     )
     emotion_scale_mode: Literal["fixed", "auto"] = Field(
@@ -289,27 +297,80 @@ class BehaviorSectionConfig(PluginConfigBase):
                 "fixed": {"label": "固定（手动设置）", "description": "始终用上方 [doubao] emotion_scale 的值"},
                 "auto": {"label": "麦麦自主", "description": "麦麦自主语音时由 LLM 按情感挑强度 1~5"},
             },
+            "hint": "fixed=用上方固定强度｜auto=麦麦自主语音时自己挑强度（1~5）",
         },
     )
     timeout_seconds: float = Field(
         default=30.0,
         description="请求火山接口超时（秒）",
-        json_schema_extra={"label": "超时（秒）"},
+        json_schema_extra={"label": "超时（秒）", "hint": "单次合成请求的最长等待时间"},
     )
     max_text_length: int = Field(
         default=150,
         description="单条语音最大文本长度（超过按句切分多条发送）",
-        json_schema_extra={"label": "单条最大字数"},
+        json_schema_extra={"label": "单条最大字数", "hint": "超过就按句子切成多条语音依次发"},
     )
     fallback_to_text: bool = Field(
         default=True,
         description="合成失败时把文本以文字形式发出（避免用户干等）",
-        json_schema_extra={"label": "失败降级发文字"},
+        json_schema_extra={"label": "失败降级发文字", "hint": "合成失败时自动改发文字，避免用户干等"},
     )
     send_error_prompt: bool = Field(
         default=True,
         description="合成失败时向用户发一句提示",
-        json_schema_extra={"label": "失败提示"},
+        json_schema_extra={"label": "失败提示", "hint": "合成失败时额外发一句“语音合成失败了”之类的说明"},
+    )
+    sync_chat_context: bool = Field(
+        default=True,
+        description=(
+            "发送语音后把原文写回麦麦的对话上下文。"
+            "关掉后麦麦下一轮不知道自己说过什么（宿主默认不同步语音消息）"
+        ),
+        json_schema_extra={
+            "label": "同步对话上下文",
+            "hint": "发完语音把原文补进对话历史，麦麦才知道自己说过什么；建议保持开启",
+        },
+    )
+    follow_segmentation: bool = Field(
+        default=False,
+        description=(
+            "跟随分段发送：开启后本轮回复的每一段都各自转语音，"
+            "配合宿主的后处理分段或「智能分段插件」使用。"
+            "关闭时只把本轮第一条回复转成语音（可能丢失后续分段）"
+        ),
+        json_schema_extra={
+            "label": "跟随分段发语音",
+            "hint": "开=配合宿主分段或智能分段插件，每段各自转语音；关=只转第一条",
+        },
+    )
+    cache_enabled: bool = Field(
+        default=False,
+        description=(
+            "把合成结果缓存到本地：同样的文本+音色+情感+语速直接复用音频，"
+            "不重复调用火山接口（省钱、省等待）"
+        ),
+        json_schema_extra={"label": "本地合成缓存", "hint": "同文本同音色直接复用本地音频，不再调火山接口"},
+    )
+    cache_dir: str = Field(
+        default="",
+        description="缓存目录；留空 = MaiBot 启动目录下的 doubao-tts-cache/。建议填绝对路径",
+        json_schema_extra={"label": "缓存目录", "hint": "留空 = MaiBot 启动目录下的 doubao-tts-cache/，建议填绝对路径"},
+    )
+    cache_max_files: int = Field(
+        default=500,
+        description="缓存文件数量上限，超出后按最旧优先清理",
+        json_schema_extra={"label": "缓存上限（条）", "hint": "文件数超过上限时按最旧优先清理"},
+    )
+    context_prefix: str = Field(
+        default="[语音]",
+        description=(
+            "写回对话上下文时加在原文前面的标记，用来表明这是语音。"
+            "默认「[语音]」；清空则只写原文"
+        ),
+        json_schema_extra={
+            "label": "上下文标记",
+            "hint": "写回对话上下文时加在原文前，让麦麦知道这句是语音说的；清空则只写原文",
+        },
     )
 
 
@@ -418,6 +479,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return
         if not self._probability_enabled():
             return
+        # 新一轮开始：先清掉上一轮可能残留的标记。
+        # 跟随分段模式下标记会保留到本轮所有分段发完，所以必须在这里归零。
+        self._pending_voice.pop(session_id, None)
         if self._roll_probability():
             self._pending_voice[session_id] = time.time()
             self.ctx.logger.info("[豆包TTS] 概率命中：会话 %s 本轮回复将用语音", session_id)
@@ -451,18 +515,66 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         text, _ = await self._extract_message_text(message)
         if not text:
             return {"action": "continue"}
-        # 消费标记：只对本轮回复生效
-        self._pending_voice.pop(session_id, None)
-        self.ctx.logger.info("[豆包TTS] 概率语音：会话 %s 文字回复 → 语音（%d字）", session_id, len(text))
+        follow = self._get("behavior", "follow_segmentation", False)
+        if not follow:
+            # 不跟随分段：只转第一条，消费掉标记
+            self._pending_voice.pop(session_id, None)
+        self.ctx.logger.info(
+            "[豆包TTS] 概率语音：会话 %s 文字回复 → 语音（%d字%s）",
+            session_id, len(text), "，跟随分段" if follow else "",
+        )
         self._sending_pending_voice = True
         try:
-            ok, note = await self._handle_speech(text, session_id, "概率语音")
-            if not ok:
-                self.ctx.logger.warning("[豆包TTS] 概率语音失败: %s（已按配置降级处理）", note)
-            # 无论成功失败，都 abort 原文字（失败已由 _handle_speech 降级为文字发出）
-            return {"action": "abort"}
+            # 统一用「原地替换」而不是中止原消息（v1.4.5）。
+            # 旧做法 abort 会让麦麦的 reply 工具拿到"发送失败"，planner/LLM 便会重试发送，
+            # 语音和文字就会反复出现；替换则让发送链正常走完，一次成功。
+            return await self._replace_with_voice(message, text, kwargs)
         finally:
             self._sending_pending_voice = False
+
+    async def _replace_with_voice(
+        self, message: Dict[str, Any], text: str, kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """把一条待发的文字消息原地换成语音消息（用于跟随分段模式）。
+
+        与「中止原消息 + 自己另发」不同，这里让原消息继续走完发送流程：
+        分段插件的补发、宿主的后处理都不会被打断，语音也就跟着文本一段一段发。
+        合成失败时返回 continue，让原文照常发出，不会丢内容。
+        """
+        if not self._api_key():
+            self.ctx.logger.warning("[豆包TTS] 未配置 API Key，本条保持文字")
+            return {"action": "continue"}
+
+        max_len = max(1, int(self._get("behavior", "max_text_length", 150) or 150))
+        segments = _split_sentences(text, max_len)
+        if not segments:
+            return {"action": "continue"}
+
+        session_id = str(message.get("session_id") or "").strip()
+        voice_segments: List[Dict[str, Any]] = []
+        for seg in segments:
+            success, audio, info = await self._synthesize_one(seg)
+            if not success or not audio:
+                self.ctx.logger.warning("[豆包TTS] 分段合成失败，整条回退为文字: %s", info)
+                return {"action": "continue"}
+            voice_segments.append({
+                "type": "voice",
+                # data 留空：可见文本会渲染成「[语音消息]」，
+                # 避免把一长串 base64 灌进麦麦的对话上下文
+                "data": "",
+                "hash": "",
+                "binary_data_base64": base64.b64encode(audio).decode("ascii"),
+            })
+
+        new_message = dict(message)
+        new_message["raw_message"] = voice_segments
+        self.ctx.logger.info(
+            "[豆包TTS] 会话 %s 已把该段文字换成 %d 条语音（跟随分段）", session_id, len(voice_segments)
+        )
+        # 语音本身不带文字，另外把原文补进对话上下文
+        if self._get("behavior", "sync_chat_context", True):
+            await self._append_chat_context(session_id, text)
+        return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
 
     # ── 生命周期 ────────────────────────────────────────────────────────
 
@@ -486,6 +598,77 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.info("[豆包TTS] 配置更新 scope=%s version=%s", scope, version)
 
     # ── 火山合成 ────────────────────────────────────────────────────────
+
+    # ── 本地合成缓存 ────────────────────────────────────────────────────
+
+    def _cache_dir(self) -> Optional[Path]:
+        """缓存目录；未开启或建不出来时返回 None（等于禁用缓存）。"""
+        if not bool(self._get("behavior", "cache_enabled", False)):
+            return None
+        raw = str(self._get("behavior", "cache_dir", "") or "").strip()
+        base = Path(raw) if raw else Path("doubao-tts-cache")
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001 缓存失败不该影响合成
+            self.ctx.logger.warning("[豆包TTS] 缓存目录不可用（%s），本次不使用缓存", exc)
+            return None
+        return base
+
+    @staticmethod
+    def _cache_key(req_params: Dict[str, Any]) -> str:
+        """缓存键：直接对发出去的合成参数做摘要，文本/音色/情感/语速/音量天然都在里面。"""
+        try:
+            body = json.dumps(req_params, ensure_ascii=False, sort_keys=True)
+        except Exception:  # noqa: BLE001
+            return ""
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    def _cache_ext(self) -> str:
+        return str(self._get("doubao", "audio_format", "mp3")).strip().lstrip(".") or "mp3"
+
+    def _cache_lookup(self, cache_key: str, cache_dir: Path) -> Optional[bytes]:
+        path = cache_dir / f"{cache_key}.{self._cache_ext()}"
+        try:
+            if not path.is_file():
+                return None
+            data = path.read_bytes()
+            if not data:
+                return None
+            path.touch()  # 命中刷新时间戳，让清理时保留热数据
+            return data
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("[豆包TTS] 读取缓存失败（忽略）: %s", exc)
+            return None
+
+    def _cache_store(self, cache_key: str, audio: bytes, cache_dir: Path) -> None:
+        try:
+            (cache_dir / f"{cache_key}.{self._cache_ext()}").write_bytes(audio)
+            self._cache_cleanup(cache_dir)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("[豆包TTS] 写入缓存失败（忽略）: %s", exc)
+
+    def _cache_cleanup(self, cache_dir: Path) -> None:
+        """文件数超过上限时，按最旧优先清理。"""
+        try:
+            limit = max(10, int(self._get("behavior", "cache_max_files", 500) or 500))
+        except (TypeError, ValueError):
+            limit = 500
+        try:
+            files = [p for p in cache_dir.iterdir() if p.is_file()]
+        except Exception:  # noqa: BLE001
+            return
+        if len(files) <= limit:
+            return
+        files.sort(key=lambda p: p.stat().st_mtime)
+        removed = 0
+        for stale in files[: len(files) - limit]:
+            try:
+                stale.unlink()
+                removed += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if removed:
+            self.ctx.logger.info("[豆包TTS] 缓存超上限，已清理 %d 个最旧文件", removed)
 
     async def _synthesize_one(
         self, text: str, overrides: Optional[Dict[str, Any]] = None
@@ -563,6 +746,17 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if vol:
             req_params["volume_ratio"] = round(1.0 + vol / 100.0, 4)
 
+        # 本地缓存：同样的文本+音色+情感+语速直接复用上次的音频，不重复调 API
+        cache_dir = self._cache_dir()
+        cache_key = self._cache_key(req_params) if cache_dir is not None else ""
+        if cache_dir is not None and cache_key:
+            cached = self._cache_lookup(cache_key, cache_dir)
+            if cached:
+                self.ctx.logger.info(
+                    "[豆包TTS] 命中本地缓存（%d 字节），跳过 API 调用", len(cached)
+                )
+                return True, cached, voice_type
+
         headers = {
             "Content-Type": "application/json",
             "X-Api-Key": api_key,
@@ -614,6 +808,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
                     if not audio:
                         return False, b"", "火山返回空音频（检查音色与 resource_id 是否匹配：预置音色用 seed-tts-2.0，复刻音色用 seed-icl-2.0）"
                     self.ctx.logger.info("[豆包TTS] 合成成功 %d 字节", len(audio))
+                    if cache_dir is not None and cache_key:
+                        self._cache_store(cache_key, audio, cache_dir)
                     return True, audio, voice_type
         except asyncio.TimeoutError:
             self.ctx.logger.error("[豆包TTS] 请求超时（%ss）", timeout)
@@ -625,14 +821,48 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             self.ctx.logger.error("[豆包TTS] 异常: %s", exc, exc_info=True)
             return False, b"", f"错误: {exc}"
 
-    async def _send_voice(self, audio: bytes, stream_id: str) -> bool:
-        """把音频 base64 后经 send.custom("voice") 发到会话。"""
+    async def _send_voice(self, audio: bytes, stream_id: str, text: str = "") -> bool:
+        """把音频 base64 后经 send.custom("voice") 发到会话，并把原文写回对话上下文。
+
+        只发语音是不够的：宿主 send_service 的 sync_to_maisaka_history 默认关闭，
+        而语音组件的可见文本只会渲染成「[语音消息]」，所以麦麦下一轮既不知道自己发过语音、
+        也不知道说了什么。这里补两件事：
+          1) processed_plain_text 让入库的语音带上文字（长期记忆能检索到这句话）；
+          2) maisaka.context.append 把原文写回对话历史（planner / replyer 读的就是它）。
+        """
         try:
             b64 = base64.b64encode(audio).decode("ascii")
-            return bool(await self.ctx.send.custom("voice", b64, stream_id))
+            ok = bool(
+                await self.ctx.send.custom(
+                    "voice", b64, stream_id, processed_plain_text=text
+                )
+            )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.error("[豆包TTS] 发送语音失败: %s", exc)
             return False
+
+        if ok and text and self._get("behavior", "sync_chat_context", True):
+            await self._append_chat_context(stream_id, text)
+        return ok
+
+    async def _append_chat_context(self, stream_id: str, text: str) -> None:
+        """把刚说出去的话写回麦麦的对话上下文。"""
+
+        prefix = str(self._get("behavior", "context_prefix", "") or "").strip()
+        visible = f"{prefix}{text}" if prefix else text
+        try:
+            result = await self.ctx.maisaka.context.append(
+                stream_id=stream_id,
+                segments=[{"type": "text", "data": visible}],
+                visible_text=visible,
+                source_kind="guided_reply",
+            )
+            if isinstance(result, dict) and not result.get("success", True):
+                self.ctx.logger.warning(
+                    "[豆包TTS] 同步对话上下文失败: %s", result.get("error", "未知原因")
+                )
+        except Exception as exc:  # noqa: BLE001 同步失败不该影响已经发出去的语音
+            self.ctx.logger.warning("[豆包TTS] 同步对话上下文异常: %s", exc)
 
     async def _speech(self, text: str, stream_id: str, overrides: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """把整段文本切成多条语音逐段发送。返回 (是否全部成功, 说明)。"""
@@ -648,7 +878,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             if not success:
                 self.ctx.logger.warning("[豆包TTS] 第 %d/%d 段失败: %s", i + 1, total, info)
                 continue
-            if await self._send_voice(audio, stream_id):
+            if await self._send_voice(audio, stream_id, seg):
                 ok += 1
                 last_voice = info
             await asyncio.sleep(0.35)
@@ -690,8 +920,11 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.warning("[豆包TTS] 语音合成失败(%s): %s", source, note)
         if self._get("behavior", "fallback_to_text", True):
             try:
-                await self.ctx.send.text(text, stream_id)
-                return True, "语音合成失败，已改为文字回复"
+                if await self.ctx.send.text(text, stream_id):
+                    # 降级成文字时同样要知道自己说过什么，行为才一致
+                    if self._get("behavior", "sync_chat_context", True):
+                        await self._append_chat_context(stream_id, text)
+                    return True, "语音合成失败，已改为文字回复"
             except Exception:
                 pass
         await self._maybe_error(stream_id, "语音合成失败了，请稍后再试")
@@ -799,9 +1032,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return {"success": False, "message": "缺少 stream_id，无法发送语音"}
         if not (text or "").strip():
             return {"success": False, "message": "text 为空，未发送"}
-        # Tool 模式跟随总开关：手动命令/命令开关控制 /说；自主语音方式为 off 时禁用 LLM 自主
-        if not self._get("behavior", "command_enabled", True):
-            return {"success": False, "message": "语音功能当前已禁用"}
+        # 麦麦自主语音由 auto_voice_mode 管控（off=麦麦不自主）；
+        # command_enabled 只管 /说 手动命令，不该挡这里（修 v1.4.4：原版把它错用在 Tool 上，
+        # 关掉手动命令会让麦麦每次调用本工具都失败）。
         if self._auto_voice_mode() == "off":
             return {"success": False, "message": "麦麦自主语音已关闭（behavior.auto_voice_mode=off），请使用 /说 手动命令"}
         # 语速/音量为连续数值，仅支持手动固定（不在此工具参数中提供）
