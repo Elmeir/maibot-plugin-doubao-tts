@@ -10,10 +10,10 @@
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/Elmeir/doubao-tts",
-    "homepage": "https://github.com/Elmeir/doubao-tts",
-    "documentation": "https://github.com/Elmeir/doubao-tts#readme",
-    "issues": "https://github.com/Elmeir/doubao-tts/issues"
+    "repository": "https://github.com/Elmeir/maibot-plugin-doubao-tts",
+    "homepage": "https://github.com/Elmeir/maibot-plugin-doubao-tts",
+    "documentation": "https://github.com/Elmeir/maibot-plugin-doubao-tts#readme",
+    "issues": "https://github.com/Elmeir/maibot-plugin-doubao-tts/issues"
   },
   "host_application": {
     "min_version": "1.2.0",
