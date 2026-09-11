@@ -83,6 +83,7 @@ loudness = 0                          # ⚠️ 音量 -50~100：火山连续数�
 
 [behavior]                          # 页签：行为
 command_enabled = true                # 手动 /说 /语音 命令开关
+command_cooldown_seconds = 10         # 同一会话两次语音合成的最小间隔（秒），0=不限流；防刷屏/刷费用
 auto_voice_mode = "llm"               # 麦麦自主语音：llm / probability / off（下拉）
 auto_voice_probability = 0.1          # 概率模式触发概率 0~1（仅 probability 生效）
 emotion_mode = "fixed"                # 情感来源：fixed / auto（下拉）
@@ -145,7 +146,7 @@ cache_max_files = 500                 # 缓存文件数上限，超出按最旧�
 
 ## 使用
 
-- **手动测试**：`/说 你好呀`、`/语音 今天天气真好`、`/speak hello`——任何时候都能用，麦麦把文本转语音发出来。
+- **手动测试**：`/说 你好呀`、`/语音 今天天气真好`、`/speak hello`——任何时候都能用，麦麦把文本转语音发出来。命令只响应整条消息即命令的形态（句中出现" /说"不会触发）；同一会话默认 10 秒冷却（`command_cooldown_seconds` 可调，0=不限流），防止刷屏与刷费用。
 - **帮助**：`/语音帮助`（看当前状态、可用音色）
 - **麦麦自主语音方式**（`[behavior] auto_voice_mode`，三选一）：
   - `llm`（默认）：插件注册「speak_text」工具，麦麦在合适场景（如你要求"用语音说"，或它觉得该活泼一下）**自行判断**是否用语音，最自然、不打扰；

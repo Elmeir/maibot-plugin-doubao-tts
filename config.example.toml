@@ -24,6 +24,7 @@ loudness = 0              # 音量 -50~100（0=正常）。火山连续数值，
 
 [behavior]
 command_enabled = true       # 启用 /说 /语音 手动命令
+command_cooldown_seconds = 10 # 同一会话两次语音合成的最小间隔（秒），0=不限流；防刷屏/刷费用
 auto_voice_mode = "llm"      # 麦麦自主语音：llm=由 LLM 自行判断何时用语音（推荐）；probability=按概率偶尔语音；off=仅手动命令
 auto_voice_probability = 0.1 # 概率模式的触发概率 0~1（0.1=平均每10轮约1轮语音），仅 probability 模式生效
 emotion_mode = "fixed"       # 情感来源：fixed=用 [voice_tone] emotion 固定值；auto=麦麦自主(llm模式)时由 LLM 现场挑

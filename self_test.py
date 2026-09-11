@@ -50,10 +50,16 @@ def install_fake_sdk() -> None:
         return func
 
     def _decorator_factory(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        """装饰器占位：先收配置参数，再原样保留函数。"""
+        """装饰器占位：先收配置参数（pattern 等记录到函数属性供断言），再原样保留函数。"""
         if len(args) == 1 and callable(args[0]) and not kwargs:
             return args[0]
-        return _keep
+
+        def wrap(func):  # noqa: ANN001, ANN202
+            if kwargs.get("pattern"):
+                func._cmd_pattern = kwargs["pattern"]
+            return func
+
+        return wrap
 
     sdk.MaiBotPlugin = MaiBotPlugin
     sdk.PluginConfigBase = PluginConfigBase
@@ -354,6 +360,57 @@ def main() -> int:
     check("Tool 空文本返回失败", result.get("success") is False)
     result = asyncio.run(pl._tool_speak(text="你好", stream_id=""))
     check("Tool 缺 stream_id 返回失败", result.get("success") is False)
+
+    # ── 7.5 命令 pattern 锚定 + 冷却限流（AI 审查 #661/#663 标准） ──
+    import re as _re
+
+    say_pat = getattr(plugin_module.DoubaoTTSPlugin._cmd_say, "_cmd_pattern", "")
+    help_pat = getattr(plugin_module.DoubaoTTSPlugin._cmd_help, "_cmd_pattern", "")
+    check(
+        "命令 pattern 以 ^ 锚定",
+        say_pat.startswith("^") and help_pat.startswith("^"),
+        f"{say_pat!r} / {help_pat!r}",
+    )
+    check(
+        "pattern 不误吃句中/句尾触发",
+        _re.search(say_pat, "你好 /说 你好呀") is None
+        and _re.search(help_pat, "hello tts帮助") is None,
+    )
+    check(
+        "pattern 整条消息正常命中",
+        _re.search(say_pat, "/说 你好呀") is not None
+        and _re.search(help_pat, "/语音帮助") is not None,
+    )
+
+    async def fake_speech_ok(text, stream_id, overrides=None):  # noqa: ANN001, ANN202
+        return True, "已发送 1 条语音"
+
+    pl, logger, send, maisaka = make_plugin(command_cooldown_seconds=10)
+    pl._plugin_config_instance.doubao = DoubaoSectionConfig(api_key="sk-test")  # noqa: SLF001
+    pl._speech = fake_speech_ok  # noqa: SLF001
+    ok1 = asyncio.run(pl._handle_speech("第一次", "s1", "命令"))
+    ok2 = asyncio.run(pl._handle_speech("第二次", "s1", "命令"))
+    ok3 = asyncio.run(pl._handle_speech("换个会话", "s2", "命令"))
+    check(
+        "冷却窗口内同会话被拦截、其他会话不受影响",
+        ok1[0] is True and ok2 == (False, "触发限流") and ok3[0] is True,
+        f"{ok1} / {ok2} / {ok3}",
+    )
+    check("被拦截的命令向用户发冷却提示", any("冷却" in t for t, _ in send.texts))
+
+    n_before = len(send.texts)
+    blocked_tool = asyncio.run(pl._handle_speech("工具调用", "s1", "Tool"))
+    check(
+        "Tool 来源限流只返回失败不发提示",
+        blocked_tool == (False, "触发限流") and len(send.texts) == n_before,
+    )
+
+    pl, logger, send, maisaka = make_plugin(command_cooldown_seconds=0)
+    pl._plugin_config_instance.doubao = DoubaoSectionConfig(api_key="sk-test")  # noqa: SLF001
+    pl._speech = fake_speech_ok  # noqa: SLF001
+    ok1 = asyncio.run(pl._handle_speech("一", "s1", "命令"))
+    ok2 = asyncio.run(pl._handle_speech("二", "s1", "命令"))
+    check("冷却设为 0 时不限流", ok1[0] is True and ok2[0] is True)
 
     # ── 8. 生命周期 ──
     pl, logger, send, maisaka = make_plugin()
