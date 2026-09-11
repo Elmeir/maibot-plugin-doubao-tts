@@ -1,18 +1,16 @@
-# 豆包语音TTS（新版控制台）
+# 豆包语音 TTS（新版控制台）
 
 > 让麦麦把文字变成语音说出口——调用**火山引擎·豆包语音合成大模型**（新版控制台鉴权），内置官方预置音色库，也支持你自己的复刻音色。
 
 - 插件 ID：`github.elmeir.doubao-tts`
-- 版本：1.4.0
-- 类型：扩展插件
-- 最低麦麦版本：1.2.0（使用 maibot-plugin-sdk v2）
-- 依赖：`aiohttp`（≥3.8.0，自动安装）
-- 作者：Elmeir（fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)）
-- License：MIT
+- 宿主要求：MaiBot ≥ 1.2.0（maibot-plugin-sdk ≥ 2.0）
+- 依赖：`aiohttp` ≥ 3.8.0（自动安装）
+- 作者：[Elmeir](https://github.com/Elmeir)（fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)）｜ License：MIT
+- 版本：见 [_manifest.json](_manifest.json)，变更见 [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
-## 一、适用边界（安装前请先读）
+## 适用边界（安装前请先读）
 
 ### 依赖"豆包语音"云端服务
 
@@ -43,7 +41,7 @@
 
 ---
 
-## 二、工作原理
+## 工作原理
 
 1. **触发**：你发 `/说 文本`（或麦麦通过 Tool 自主决定用语音）；
 2. **合成**：插件把文本 POST 给火山豆包语音接口，流式接收音频（mp3）；
@@ -52,13 +50,20 @@
 
 ---
 
-## 三、安装
+## 安装
 
-1. 将整个 `doubao_tts_plugin` 文件夹放入麦麦的 `plugins/` 目录；
-2. 麦麦自动加载（或重启麦麦）。若自动安装依赖失败，手动补装：`pip install -r requirements.txt`（或 `python -m pip install aiohttp`）；
-3. 日志出现 `[豆包TTS] 插件已加载` 即成功。
+```bash
+cd /你的部署目录/plugins        # 例如 /opt/MaiBot/plugins
+git clone https://github.com/Elmeir/maibot-plugin-doubao-tts.git
+# 重启麦麦（systemctl restart xxx / docker compose restart / 重启 bot.py）
+```
 
-## 四、配置（必须填 API Key）
+> 目录名保持 `maibot-plugin-doubao-tts`：插件配置存在插件目录内的 `config.toml`，换目录名会丢配置。
+
+1. 麦麦自动加载（或重启麦麦）。若自动安装依赖失败，手动补装：`pip install -r requirements.txt`（或 `python -m pip install aiohttp`）；
+2. 日志出现 `[豆包TTS] 插件已加载` 即成功。
+
+## 配置（必须填 API Key）
 
 配置按用途分为多个页签（WebUI）：**豆包语音**（连接）、**音色与情感**、**语速与音量**、**行为**。config.toml 结构对应如下：
 
@@ -102,7 +107,7 @@ emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下�
 
 > ⚠️ `config.toml` 含密钥，**请勿随插件分发/上传仓库**。本仓库只提供 `config.example.toml`。
 
-## 五、预置音色表（seed-tts-2.0，选填音色名即可）
+## 预置音色表（seed-tts-2.0，选填音色名即可）
 
 | 音色名（配置里填这个） | voice_type ID | 风格 |
 | --- | --- | --- |
@@ -125,12 +130,12 @@ emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下�
 
 > 注意：预置音色（seed-tts-2.0）与复刻音色（seed-icl-2.0）**不可混用**，改 `voice` 时要同步核对 `resource_id`。
 
-## 六、情感与效果（可选）
+## 情感与效果（可选）
 
 `emotion` 取值：开心 / 伤心 / 生气 / 害怕 / 惊讶 / 讨厌 / 哭泣 / 抱歉 / 平静 / 播音 / 讲故事。
 `emotion_scale` 1~5 调节强度。语速/音量在 -50~100 间调整，0 为正常。
 
-## 七、使用
+## 使用
 
 - **手动测试**：`/说 你好呀`、`/语音 今天天气真好`、`/speak hello`——任何时候都能用，麦麦把文本转语音发出来。
 - **帮助**：`/语音帮助`（看当前状态、可用音色）
@@ -144,7 +149,7 @@ emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下�
   - `emotion_scale_mode` 同理控制情感强度（1~5）。语速/音量仅手动（见上表）。
 - **换音色/改模式**：改配置即生效（热更新），无需重启。
 
-## 八、常见问题
+## 常见问题
 
 | 现象 | 原因与处理 |
 | --- | --- |
@@ -156,11 +161,11 @@ emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下�
 | 说话没声音/失败 | 平台适配器不支持语音消息通道；或看日志中 `[豆包TTS]` 具体错误 |
 | 概率模式不触发 | 检查 `auto_voice_mode="probability"` 且 `auto_voice_probability` 在 0~1 之间（默认 0.1）；命中后麦麦下一条文字回复才会转语音 |
 
-## 九、致谢
+## 致谢
 
 - 本插件 fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)，在其基础上继续维护，感谢原作者的工作。
 - 参考了靓仔开发的 [xuqian13/tts_voice_plugin](https://github.com/xuqian13/tts_voice_plugin)（多后端 TTS 插件）的功能组织思路，本插件聚焦豆包语音单一后端、精简为新版控制台鉴权。
 
-## 十、卸载
+## 卸载
 
-删除 `plugins/doubao_tts_plugin` 文件夹即可（或把 `config.toml` 里 `[plugin] enabled` 改为 `false`）。
+删除 `plugins/maibot-plugin-doubao-tts` 文件夹即可（或把 `config.toml` 里 `[plugin] enabled` 改为 `false`）。
