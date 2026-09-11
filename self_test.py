@@ -418,6 +418,36 @@ def main() -> int:
     ok2 = asyncio.run(pl._handle_speech("二", "s1", "命令"))
     check("冷却设为 0 时不限流", ok1[0] is True and ok2[0] is True)
 
+    # ── 7.6 失败提示去重 + 失败路径的 planner 结束策略 ──
+    pl, logger, send, maisaka = make_plugin()  # 未配 Key，send_error_prompt 默认开
+    r1 = asyncio.run(pl._tool_speak(text="你好", stream_id="s9"))
+    r2 = asyncio.run(pl._tool_speak(text="你好", stream_id="s9"))
+    check(
+        "失败提示 30 秒内去重（LLM 重试不刷屏）",
+        len(send.texts) == 1,
+        str(send.texts),
+    )
+    check(
+        "已提示过用户的失败结束 planner（提示 + reply 只留一条）",
+        r1.get("stop_after_execution") is True and r2.get("stop_after_execution") is True,
+        f"{r1} / {r2}",
+    )
+
+    pl, logger, send, maisaka = make_plugin(command_cooldown_seconds=10)
+    pl._plugin_config_instance.doubao = DoubaoSectionConfig(api_key="sk-test")  # noqa: SLF001
+
+    async def fake_speech_ok2(text, stream_id, overrides=None):  # noqa: ANN001, ANN202
+        return True, "已发送 1 条语音"
+
+    pl._speech = fake_speech_ok2  # noqa: SLF001
+    pl._last_speech_at["s5"] = time.time()  # 直接置为冷却中
+    r = asyncio.run(pl._tool_speak(text="你好", stream_id="s5"))
+    check(
+        "冷却静默失败且未提示过 → 不结束 planner（LLM 可转告），并引导勿重试",
+        r.get("stop_after_execution") is None and "限流" in r.get("message", "") and "不要连续重试" in r.get("message", ""),
+        str(r),
+    )
+
     # ── 8. 生命周期 ──
     pl, logger, send, maisaka = make_plugin()
     asyncio.run(pl.on_load())

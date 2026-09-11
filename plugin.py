@@ -27,6 +27,8 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, ToolParameterInfo
 
 SUPPORTED_CONFIG_VERSION = "1.4.0"
+ERROR_PROMPT_DEDUPE_SECONDS = 30.0
+"""同一会话失败提示的去重窗口（秒）：LLM 对失败有重试倾向，去重防提示刷屏。"""
 # ─── 火山引擎 API ────────────────────────────────────────────────────────────
 DOUBAO_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 DOUBAO_RESOURCE_PRESET = "seed-tts-2.0"   # 预置音色（语音合成模型 2.0）
@@ -406,6 +408,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self._sending_pending_voice: bool = False
         # 会话 → 上次语音合成时间戳（冷却限流，防刷费用/刷屏）
         self._last_speech_at: Dict[str, float] = {}
+        # 会话 → 上次失败提示时间戳（30 秒去重，防 LLM 重试导致提示刷屏）
+        self._last_error_prompt_at: Dict[str, float] = {}
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -979,12 +983,28 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         await self._maybe_error(stream_id, "语音合成失败了，请稍后再试")
         return False, note
 
-    async def _maybe_error(self, stream_id: str, msg: str) -> None:
-        if self._get("behavior", "send_error_prompt", True):
-            try:
-                await self.ctx.send.text(msg, stream_id)
-            except Exception:
-                pass
+    def _recently_prompted(self, stream_id: str) -> bool:
+        """该会话最近是否已收到过失败提示（去重窗口内）。"""
+
+        last = self._last_error_prompt_at.get(stream_id)
+        return last is not None and time.time() - last < ERROR_PROMPT_DEDUPE_SECONDS
+
+    async def _maybe_error(self, stream_id: str, msg: str) -> bool:
+        """向用户发失败提示；同一会话 30 秒内只发一次，防 LLM 重试刷屏。
+
+        Returns:
+            bool: 是否真的发出了提示。
+        """
+        if not self._get("behavior", "send_error_prompt", True):
+            return False
+        if self._recently_prompted(stream_id):
+            return False
+        self._last_error_prompt_at[stream_id] = time.time()
+        try:
+            await self.ctx.send.text(msg, stream_id)
+            return True
+        except Exception:
+            return False
 
     # ── Command：手动 ───────────────────────────────────────────────────
 
@@ -1099,7 +1119,15 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             # 即结束 planner——否则 LLM 会再调 reply 发一遍文字，内容与语音重复。
             # 仅在成功路径停止；失败时让 LLM 自行告知用户（插件侧已发降级/错误提示的除外）。
             return {"success": True, "message": note, "stop_after_execution": True}
-        return {"success": False, "message": f"语音失败：{note}"}
+        # 失败路径默认不结束 planner，让 LLM 转告用户；但若插件刚给用户发过失败提示
+        # （去重窗口内），再 reply 只会与提示重复，此时同样结束 planner。
+        msg = f"语音失败：{note}"
+        if "限流" in note:
+            msg += "；冷却期内重试仍会失败，请直接转告用户稍后再试，不要连续重试"
+        result: Dict[str, Any] = {"success": False, "message": msg}
+        if self._recently_prompted(stream_id):
+            result["stop_after_execution"] = True
+        return result
 
 
 def create_plugin() -> MaiBotPlugin:
