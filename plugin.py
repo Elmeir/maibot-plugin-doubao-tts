@@ -1095,7 +1095,10 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             overrides["emotion_scale"] = emotion_scale
         ok, note = await self._handle_speech(text, stream_id, "Tool", overrides=overrides or None)
         if ok:
-            return {"success": True, "message": note}
+            # stop_after_execution：语音已通过 send.custom 直发到会话，本批工具执行完
+            # 即结束 planner——否则 LLM 会再调 reply 发一遍文字，内容与语音重复。
+            # 仅在成功路径停止；失败时让 LLM 自行告知用户（插件侧已发降级/错误提示的除外）。
+            return {"success": True, "message": note, "stop_after_execution": True}
         return {"success": False, "message": f"语音失败：{note}"}
 
 

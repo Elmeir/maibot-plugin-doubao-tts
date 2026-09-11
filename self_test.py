@@ -336,10 +336,16 @@ def main() -> int:
     pl._handle_speech = fake_handle_speech  # noqa: SLF001
     result = asyncio.run(pl._tool_speak(text="朗读这句话", stream_id="s1"))
     check("command_enabled 不影响 Tool（v1.4.4 解耦）", result.get("success") is True and len(calls) == 1, str(result))
+    check(
+        "成功返回携带 stop_after_execution（语音后结束 planner，不再重复 reply）",
+        result.get("stop_after_execution") is True,
+        str(result),
+    )
 
     pl, logger, send, maisaka = make_plugin(auto_voice_mode="off")
     result = asyncio.run(pl._tool_speak(text="朗读这句话", stream_id="s1"))
     check("auto_voice_mode=off 拒绝 Tool 自主语音", result.get("success") is False)
+    check("失败路径不带 stop_after_execution（让 LLM 告知用户）", "stop_after_execution" not in result, str(result))
 
     pl, logger, send, maisaka = make_plugin(emotion_mode="fixed")
     pl._handle_speech = fake_handle_speech  # noqa: SLF001

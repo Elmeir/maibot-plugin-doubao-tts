@@ -1,5 +1,19 @@
 # 更新日志
 
+## v1.4.9 (2026-09-11) 修复：语音发出后 planner 继续跑、reply 反复发文字
+
+现象：麦麦自主语音（Tool `doubao_tts_speak`）成功发出语音后，planner 不会结束，
+LLM 接着调用 reply 再发一遍文字，内容与语音重复，表现为"反复发送 reply"。
+
+修复：工具**成功返回**时携带 `"stop_after_execution": True`（返回 dict 键，
+SDK 2.8.0 的 @Tool 装饰器无此参数，键随返回值透传宿主）——本批工具执行完即结束
+planner，语音之后不再生成文字回复。
+
+- 仅成功路径携带该键：失败时（未发声、或插件已发降级/错误提示之外的场景）让 LLM
+  自行告知用户，不吞掉交互。
+- self_test 新增 2 项断言（成功带键、失败不带键）。
+- 顺带修正 README 中工具名笔误（speak_text → doubao_tts_speak）。
+
 ## v1.4.8 (2026-09-11) 收录前审查加固（对照插件中心 AI 审查标准）
 
 对照插件中心（plugin-repo）AI 审查（maisakagithub bot）的实测标准自查后的两处加固：
