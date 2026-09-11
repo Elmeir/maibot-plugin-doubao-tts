@@ -3,7 +3,7 @@
 > 让麦麦把文字变成语音说出口——调用**火山引擎·豆包语音合成大模型**（新版控制台鉴权），内置官方预置音色库，也支持你自己的复刻音色。
 
 - 插件 ID：`github.elmeir.doubao-tts`
-- 宿主要求：MaiBot ≥ 1.2.0（maibot-plugin-sdk ≥ 2.0）
+- 宿主要求：MaiBot ≥ 1.2.4（maibot-plugin-sdk ≥ 2.0）
 - 依赖：`aiohttp` ≥ 3.8.0（自动安装）
 - 作者：[Elmeir](https://github.com/Elmeir)（fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)）｜ License：MIT
 - 版本：见 [_manifest.json](_manifest.json)，变更见 [CHANGELOG.md](CHANGELOG.md)
@@ -74,7 +74,7 @@ resource_id = "seed-tts-2.0"        # 预置音色；复刻音色改 seed-icl-2.
 
 [voice_tone]                        # 页签：音色与情感
 voice = "小何 2.0"                    # 音色名或 voice_type ID
-emotion = ""                          # 情感固定值（可空）；见下方"参数来源"
+emotion = "none"                      # 情感固定值：none=无（正常语气）；见下方"参数来源"
 emotion_scale = 1.0                   # 情感强度固定值 1~5
 
 [speed_loud]                        # 页签：语速与音量
@@ -82,9 +82,17 @@ speech_rate = 0                       # ⚠️ 语速 -50~100：火山连续数�
 loudness = 0                          # ⚠️ 音量 -50~100：火山连续数值，仅手动，麦麦不可自主
 
 [behavior]                          # 页签：行为
+command_enabled = true                # 手动 /说 /语音 命令开关
 auto_voice_mode = "llm"               # 麦麦自主语音：llm / probability / off（下拉）
-emotion_mode = "fixed"                # 情感来源：fixed=用 [voice_tone] emotion / auto=麦麦现场挑（下拉）
+auto_voice_probability = 0.1          # 概率模式触发概率 0~1（仅 probability 生效）
+emotion_mode = "fixed"                # 情感来源：fixed / auto（下拉）
 emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下拉）
+sync_chat_context = true              # 发语音后把原文写回麦麦上下文（推荐开启）
+context_prefix = "[语音]"             # 写回上下文时加在原文前的标记
+follow_segmentation = false           # 跟随分段：每段各自转语音（默认只转第一条）
+cache_enabled = false                 # 本地合成缓存（同文本同音色复用音频）
+cache_dir = ""                        # 缓存目录；留空 = 宿主插件数据目录下的 doubao-tts-cache/
+cache_max_files = 500                 # 缓存文件数上限，超出按最旧清理
 ```
 
 **API Key 在哪拿**：火山引擎控制台 → 豆包语音 → **API Key 管理** → 新建/复制。需先开通"语音合成大模型"服务（控制台 → 开通管理）。
@@ -165,6 +173,16 @@ emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下�
 
 - 本插件 fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)，在其基础上继续维护，感谢原作者的工作。
 - 参考了靓仔开发的 [xuqian13/tts_voice_plugin](https://github.com/xuqian13/tts_voice_plugin)（多后端 TTS 插件）的功能组织思路，本插件聚焦豆包语音单一后端、精简为新版控制台鉴权。
+
+## 本地自检（可选）
+
+```bash
+pip install aiohttp pydantic
+python self_test.py
+```
+
+不依赖宿主与网络：用假 SDK 环境加载插件，覆盖配置模型、文本切分、概率模式、
+出站替换钩子、命令/Tool 管控、本地缓存与生命周期日志等 40+ 项断言。
 
 ## 卸载
 

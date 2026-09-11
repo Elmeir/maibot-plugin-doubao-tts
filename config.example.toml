@@ -28,6 +28,12 @@ auto_voice_mode = "llm"      # 麦麦自主语音：llm=由 LLM 自行判断何�
 auto_voice_probability = 0.1 # 概率模式的触发概率 0~1（0.1=平均每10轮约1轮语音），仅 probability 模式生效
 emotion_mode = "fixed"       # 情感来源：fixed=用 [voice_tone] emotion 固定值；auto=麦麦自主(llm模式)时由 LLM 现场挑
 emotion_scale_mode = "fixed" # 情感强度来源：fixed=用 [voice_tone] emotion_scale；auto=LLM 按情感挑 1~5
+sync_chat_context = true     # 发送语音后把原文写回麦麦对话上下文（推荐开启，麦麦才知道自己说过什么）
+context_prefix = "[语音]"    # 写回上下文时加在原文前的标记；清空则只写原文
+follow_segmentation = false  # 跟随分段：本轮每一段各自转语音（配合宿主分段/智能分段插件）；关闭只转第一条
+cache_enabled = false        # 本地合成缓存：同样文本+音色+情感直接复用音频，不再调火山接口
+cache_dir = ""               # 缓存目录；留空 = 宿主插件数据目录下的 doubao-tts-cache/，建议填绝对路径
+cache_max_files = 500        # 缓存文件数上限，超出按最旧优先清理
 timeout_seconds = 30         # 请求超时（秒）
 max_text_length = 150        # 单条语音最大字数（超过按句切分多条）
 fallback_to_text = true      # 合成失败时降级为文字发出

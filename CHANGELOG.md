@@ -1,5 +1,20 @@
 # 更新日志
 
+## v1.4.7 (2026-09-11) 规范符合性修复
+
+1. **宿主兼容下限抬到 1.2.4**：插件挂载的 `chat.receive.after_process` /
+   `send_service.before_send` 钩点在 1.2.0~1.2.3 上不存在（钩点缺失 = 插件注册
+   直接失败），manifest 的 `host_application.min_version` 如实抬到 1.2.4。
+2. 修复 `/语音帮助` 的"当前音色"读错配置段（`[doubao] voice` → `[voice_tone] voice`），
+   此前永远显示默认值。
+3. 本地缓存目录默认值改为宿主注入的插件数据目录（`ctx.paths.data_dir`）下的
+   `doubao-tts-cache/`，不再写 MaiBot 启动目录；显式配置 `cache_dir` 不受影响，
+   拿不到宿主目录时退回相对路径旧行为。
+4. 移除游离于宿主日志体系的模块级 `logging.getLogger`（规范要求统一走 `ctx.logger`）。
+5. Command 返回值 weight 由 bool 改为 int（运行时行为不变，类型对齐 SDK 规范）。
+6. 新增 `self_test.py` 本地自检（无需宿主与网络）；config.example.toml 与 README
+   补齐 1.4.3~1.4.6 新增的 6 个配置项（上下文同步/跟随分段/本地缓存）。
+
 ## v1.4.6 (2026-09-11) 上下文标记默认开启 + 配置页说明修复
 
 1. `behavior.context_prefix` 默认值从空改为 **`[语音]`**——

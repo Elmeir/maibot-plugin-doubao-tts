@@ -14,7 +14,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import logging
 import random
 import time
 import uuid
@@ -26,8 +25,6 @@ from pydantic import field_validator
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, ToolParameterInfo
-
-logger = logging.getLogger("plugin.doubao_tts")
 
 SUPPORTED_CONFIG_VERSION = "1.4.0"
 # ─── 火山引擎 API ────────────────────────────────────────────────────────────
@@ -353,8 +350,8 @@ class BehaviorSectionConfig(PluginConfigBase):
     )
     cache_dir: str = Field(
         default="",
-        description="缓存目录；留空 = MaiBot 启动目录下的 doubao-tts-cache/。建议填绝对路径",
-        json_schema_extra={"label": "缓存目录", "hint": "留空 = MaiBot 启动目录下的 doubao-tts-cache/，建议填绝对路径"},
+        description="缓存目录；留空 = 宿主注入的插件数据目录下的 doubao-tts-cache/。建议填绝对路径",
+        json_schema_extra={"label": "缓存目录", "hint": "留空 = 宿主插件数据目录下的 doubao-tts-cache/，建议填绝对路径"},
     )
     cache_max_files: int = Field(
         default=500,
@@ -597,16 +594,23 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         self.ctx.logger.info("[豆包TTS] 配置更新 scope=%s version=%s", scope, version)
 
-    # ── 火山合成 ────────────────────────────────────────────────────────
-
     # ── 本地合成缓存 ────────────────────────────────────────────────────
 
     def _cache_dir(self) -> Optional[Path]:
-        """缓存目录；未开启或建不出来时返回 None（等于禁用缓存）。"""
+        """缓存目录；未开启或建不出来时返回 None（等于禁用缓存）。
+
+        留空时默认用宿主注入的持久化数据目录（ctx.paths.data_dir）下的
+        doubao-tts-cache/——运行时数据不写启动目录；拿不到该目录时退回
+        相对路径旧行为。
+        """
         if not bool(self._get("behavior", "cache_enabled", False)):
             return None
         raw = str(self._get("behavior", "cache_dir", "") or "").strip()
-        base = Path(raw) if raw else Path("doubao-tts-cache")
+        if raw:
+            base = Path(raw)
+        else:
+            data_dir = getattr(getattr(self.ctx, "paths", None), "data_dir", None)
+            base = Path(str(data_dir)) / "doubao-tts-cache" if data_dir else Path("doubao-tts-cache")
         try:
             base.mkdir(parents=True, exist_ok=True)
         except Exception as exc:  # noqa: BLE001 缓存失败不该影响合成
@@ -944,44 +948,44 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         description="用豆包语音把指定文本说出来",
         pattern=r"(?<!\S)/(说|语音|speak)\s+(?P<text>.+)\s*$",
     )
-    async def _cmd_say(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Tuple[bool, str, bool]:
+    async def _cmd_say(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Tuple[bool, str, int]:
         """/说 文本 / 语音 文本 / speak 文本"""
         del kwargs
         if not self._get("behavior", "command_enabled", True):
-            return False, "手动命令已禁用", True
+            return False, "手动命令已禁用", 1
         if not stream_id:
-            return False, "缺少 stream_id", True
+            return False, "缺少 stream_id", 1
         groups = matched_groups or {}
         text = (groups.get("text") or "").strip()
         if not text:
             await self._maybe_error(stream_id, "用法：/说 要转成语音的文本")
-            return False, "缺少文本", True
+            return False, "缺少文本", 1
         ok, note = await self._handle_speech(text, stream_id, "命令")
-        return ok, note, True
+        return ok, note, 1
 
     @Command(
         "doubao_tts_help",
         description="查看豆包语音帮助",
         pattern=r"(?<!\S)/(语音帮助|说帮助|tts帮助)\s*$",
     )
-    async def _cmd_help(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, bool]:
+    async def _cmd_help(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
         """/语音帮助"""
         del kwargs
         if not stream_id:
-            return False, "缺少 stream_id", True
+            return False, "缺少 stream_id", 1
         voice_list = "、".join(PRESET_VOICES.keys())
         emotion_list = "、".join(PRESET_EMOTIONS.keys())
         text = (
             "【豆包语音】\n"
             f"- 用法：/说 文本 或 /语音 文本\n"
             f"- API Key：{'已配置' if self._api_key() else '未配置'}\n"
-            f"- 当前音色：{self._get('doubao', 'voice', DEFAULT_VOICE_DISPLAY)}\n"
+            f"- 当前音色：{self._get('voice_tone', 'voice', DEFAULT_VOICE_DISPLAY)}\n"
             f"- 预置音色：{voice_list}\n"
             f"- 情感（可选）：{emotion_list}\n"
             "- 换音色/情感：WebUI 插件配置里修改即可"
         )
         await self.ctx.send.text(text, stream_id)
-        return True, "已发送帮助", True
+        return True, "已发送帮助", 1
 
     # ── Tool：麦麦自主 ──────────────────────────────────────────────────
 
