@@ -1,4 +1,4 @@
-# 豆包语音 TTS（新版控制台）
+# 豆包语音 TTS（maibot-plugin-doubao-tts）
 
 > 让麦麦把文字变成语音说出口——调用**火山引擎·豆包语音合成大模型**（新版控制台鉴权），内置官方预置音色库，也支持你自己的复刻音色。
 
@@ -6,9 +6,15 @@
 - 宿主要求：MaiBot ≥ 1.2.4（maibot-plugin-sdk ≥ 2.0）
 - 依赖：`aiohttp` ≥ 3.8.0（自动安装）
 - 作者：[Elmeir](https://github.com/Elmeir)（fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)）｜ License：MIT
-- 版本：见 [_manifest.json](_manifest.json)，变更见 [CHANGELOG.md](CHANGELOG.md)
+- 版本：见 [_manifest.json](_manifest.json) ｜ 变更历史见 [CHANGELOG.md](CHANGELOG.md)
 
----
+## 功能
+
+- **手动命令**：`/说 你好呀`、`/语音 今天天气真好`、`/speak hello`——任何时候让麦麦把文本转成语音发出
+- **麦麦自主语音**：`llm`（LLM 自主判断何时用语音，最自然）/ `probability`（按概率把文字回复转语音）/ `off`（仅手动）三种模式
+- **音色与情感**：官方预置音色库（填音色名即可）+ 自己的复刻音色；情感 11 种、强度 1~5，麦麦自主语音时可由 LLM 按对话氛围现场挑选
+- **稳态设计**：合成失败自动降级为文字发出，不让对话干等；同会话冷却防刷屏刷费用；本地合成缓存复用音频；语音原文写回麦麦上下文
+- **热更新**：改配置即生效，无需重启
 
 ## 适用边界（安装前请先读）
 
@@ -38,17 +44,6 @@
 | **复刻音色**（自己克隆的声音） | `seed-icl-2.0` | voice 填复刻音色 ID，形如 `S_RcCsDWbd2`（控制台"声音复刻"里创建） |
 
 > 判断方法：`voice` 填的是 `S_...` 开头的复刻 ID → `resource_id` 必须用 `seed-icl-2.0`；填预置音色名/ID → 用 `seed-tts-2.0`。改音色时同步核对 resource_id，两者不可混用。
-
----
-
-## 工作原理
-
-1. **触发**：你发 `/说 文本`（或麦麦通过 Tool 自主决定用语音）；
-2. **合成**：插件把文本 POST 给火山豆包语音接口，流式接收音频（mp3）；
-3. **发送**：音频 base64 后经 `send.custom("voice")` 发到当前会话，无需写临时文件；
-4. **兜底**：合成失败时可按配置降级为文字发出，不让对话干等。
-
----
 
 ## 安装
 
@@ -114,6 +109,11 @@ cache_max_files = 500                 # 缓存文件数上限，超出按最旧�
 > - 语速/音量是火山接口的连续调节量，没有"档位"，交给 LLM 填数字容易怪、且不可预期，故设计为**仅手动**——这也是参考同类插件后的取舍。
 > - 改配置即生效（热更新），无需重启。
 
+### 情感与效果（可选）
+
+`emotion` 取值：开心 / 伤心 / 生气 / 害怕 / 惊讶 / 讨厌 / 哭泣 / 抱歉 / 平静 / 播音 / 讲故事。
+`emotion_scale` 1~5 调节强度。语速/音量在 -50~100 间调整，0 为正常。
+
 > ⚠️ `config.toml` 含密钥，**请勿随插件分发/上传仓库**。本仓库只提供 `config.example.toml`。
 
 ## 预置音色表（seed-tts-2.0，选填音色名即可）
@@ -138,11 +138,6 @@ cache_max_files = 500                 # 缓存文件数上限，超出按最旧�
 **复刻音色**：使用自己训练/复刻的音色时，把 `resource_id` 改为 `seed-icl-2.0`，`voice` 填复刻音色的 ID（如 `S_xxxxxxxx`）。
 
 > 注意：预置音色（seed-tts-2.0）与复刻音色（seed-icl-2.0）**不可混用**，改 `voice` 时要同步核对 `resource_id`。
-
-## 情感与效果（可选）
-
-`emotion` 取值：开心 / 伤心 / 生气 / 害怕 / 惊讶 / 讨厌 / 哭泣 / 抱歉 / 平静 / 播音 / 讲故事。
-`emotion_scale` 1~5 调节强度。语速/音量在 -50~100 间调整，0 为正常。
 
 ## 使用
 
@@ -171,10 +166,12 @@ cache_max_files = 500                 # 缓存文件数上限，超出按最旧�
 | 概率模式不触发 | 检查 `auto_voice_mode="probability"` 且 `auto_voice_probability` 在 0~1 之间（默认 0.1）；命中后麦麦下一条文字回复才会转语音 |
 | 语音失败后反复重试/重复报错 | 失败提示同一会话 30 秒内只发一次（`send_error_prompt`）；已提示过的失败会直接结束本轮 planner，LLM 不会再 reply。冷却期内（默认 10 秒）重试必定失败，属预期 |
 
-## 致谢
+## 工作原理
 
-- 本插件 fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)，在其基础上继续维护，感谢原作者的工作。
-- 参考了靓仔开发的 [xuqian13/tts_voice_plugin](https://github.com/xuqian13/tts_voice_plugin)（多后端 TTS 插件）的功能组织思路，本插件聚焦豆包语音单一后端、精简为新版控制台鉴权。
+1. **触发**：你发 `/说 文本`（或麦麦通过 Tool 自主决定用语音）；
+2. **合成**：插件把文本 POST 给火山豆包语音接口，流式接收音频（mp3）；
+3. **发送**：音频 base64 后经 `send.custom("voice")` 发到当前会话，无需写临时文件；
+4. **兜底**：合成失败时可按配置降级为文字发出，不让对话干等。
 
 ## 本地自检（可选）
 
@@ -186,6 +183,15 @@ python self_test.py
 不依赖宿主与网络：用假 SDK 环境加载插件，覆盖配置模型、文本切分、概率模式、
 出站替换钩子、命令/Tool 管控、本地缓存与生命周期日志等 40+ 项断言。
 
+## 致谢
+
+- 本插件 fork 自昭沧QWQ 的 [ZhaoCang-QWQ/doubao-tts](https://github.com/ZhaoCang-QWQ/doubao-tts)，在其基础上继续维护，感谢原作者的工作。
+- 参考了靓仔开发的 [xuqian13/tts_voice_plugin](https://github.com/xuqian13/tts_voice_plugin)（多后端 TTS 插件）的功能组织思路，本插件聚焦豆包语音单一后端、精简为新版控制台鉴权。
+
 ## 卸载
 
 删除 `plugins/maibot-plugin-doubao-tts` 文件夹即可（或把 `config.toml` 里 `[plugin] enabled` 改为 `false`）。
+
+## 许可证
+
+[MIT](LICENSE)
