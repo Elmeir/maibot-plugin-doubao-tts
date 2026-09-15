@@ -1056,7 +1056,6 @@ class DoubaoTTSPlugin(MaiBotPlugin):
 
     @Tool(
         "doubao_tts_speak",
-        description="用豆包语音把文本说出来（发语音消息），适合朗读或更生动的回复",
         brief_description="用语音（豆包TTS）说话",
         detailed_description=(
             "当用户明确要求“用语音/说话/朗读/语音回复”时使用。"
@@ -1075,14 +1074,14 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="emotion",
                 param_type=ToolParamType.STRING,
-                description="可选：情感语气（按对话氛围选一个）：开心/伤心/生气/害怕/惊讶/讨厌/哭泣/抱歉/平静/播音/讲故事",
+                description="情感语气（按对话氛围选一个）：开心/伤心/生气/害怕/惊讶/讨厌/哭泣/抱歉/平静/播音/讲故事",
                 required=False,
                 enum_values=list(PRESET_EMOTIONS.keys()),
             ),
             ToolParameterInfo(
                 name="emotion_scale",
                 param_type=ToolParamType.INTEGER,
-                description="可选：情感强度 1~5（配合 emotion 使用，1=最淡）",
+                description="情感强度 1~5（1=最淡），配合 emotion；超出范围会被忽略",
                 required=False,
             ),
         ],
