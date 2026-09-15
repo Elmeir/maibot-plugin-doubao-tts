@@ -2,6 +2,9 @@
 config.toml
 config.toml.bak*
 
+# 开发侧自检脚本（非运行时，不入库）
+self_test.py
+
 # Python 缓存与运行产物
 __pycache__/
 *.py[cod]
