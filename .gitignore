@@ -2,6 +2,10 @@
 config.toml
 config.toml.bak*
 
+# 个人复刻音源（含声纹隐私，不入库）
+src/*.wav
+src/*.mp3
+
 # 开发侧自检脚本（非运行时，不入库）
 self_test.py
 

@@ -1,6 +1,6 @@
-# 豆包语音 TTS（maibot-plugin-doubao-tts）
+# 豆包·MiMo 语音 TTS（maibot-plugin-doubao-tts）
 
-> 让麦麦把文字变成语音说出口——调用**火山引擎·豆包语音合成大模型**（新版控制台鉴权），内置官方预置音色库，也支持你自己的复刻音色。
+> 让麦麦把文字变成语音说出口——双引擎可切换：**火山引擎·豆包语音合成大模型**（内置官方预置音色库，也支持你自己的复刻音色）或**小米 MiMo 音色复刻**（`mimo-v2.5-tts-voiceclone`，丢一个 wav/mp3 进插件 `src/` 就能用你的音色说话）。
 
 - 插件 ID：`github.elmeir.doubao-tts`
 - 宿主要求：MaiBot ≥ 1.2.4（maibot-plugin-sdk ≥ 2.0）
@@ -10,17 +10,18 @@
 
 ## 功能
 
+- **双引擎**：WebUI 主页「语音引擎」下拉切换——豆包（火山）/ MiMo（小米·音色复刻）
 - **手动命令**：`/说 文本` / `/语音 文本` / `/speak text`，随时让麦麦发声
 - **麦麦自主语音**：`llm`（LLM 自主判断何时用语音）/ `probability`（按概率把文字回复转语音）/ `off`（仅手动）
-- **音色与情感**：官方预置音色库 + 复刻音色；情感 11 种、强度 1~5
+- **音色与情感**：豆包官方预置音色库 + 复刻音色；MiMo 任意音源复刻；情感 11 种、强度 1~5
 - **稳态设计**：合成失败自动降级文字；同会话冷却防刷费用；本地合成缓存；语音原文写回上下文；改配置热更新
 
 ## 适用边界（安装前必读）
 
-- 需要火山引擎账号、开通豆包语音服务并拿到 **API Key**（控制台 → 豆包语音 → API Key 管理）；合成在云端进行（服务器需可访问 `openspeech.bytedance.com`），按字符计费（有免费额度）
-- 鉴权用**新版控制台**的 `X-Api-Key`，不需要旧版 App ID / Access Token / 集群 ID
+- **豆包**：需要火山引擎账号、开通豆包语音服务并拿到 **API Key**（控制台 → 豆包语音 → API Key 管理）；合成在云端进行（服务器需可访问 `openspeech.bytedance.com`），按字符计费（有免费额度）。鉴权用**新版控制台**的 `X-Api-Key`，不需要旧版 App ID / Access Token / 集群 ID
+- **豆包音色与资源 ID 必须匹配**（最常见报错）：预置音色配 `seed-tts-2.0`；复刻音色（`S_` 开头 ID）配 `seed-icl-2.0`。配错报 `resource ID is mismatched with speaker related resource`
+- **MiMo**：需要 [MiMo 开放平台](https://mimo.mi.com) 的 API Key；模型固定 `mimo-v2.5-tts-voiceclone`，音源仅支持 wav/mp3、≤10MB；服务器需可访问 `api.xiaomimimo.com`
 - 语音经麦麦 `send.custom("voice")` 通道发出，平台适配器不支持语音消息时无法发声
-- ⚠️ **音色与资源 ID 必须匹配**（最常见报错）：预置音色配 `seed-tts-2.0`；复刻音色（`S_` 开头 ID）配 `seed-icl-2.0`。配错报 `resource ID is mismatched with speaker related resource`
 
 ## 安装
 
@@ -34,34 +35,54 @@ git clone https://github.com/Elmeir/maibot-plugin-doubao-tts.git
 
 日志出现 `[豆包TTS] 插件已加载` 即成功；依赖自动安装失败时手动 `pip install -r requirements.txt`。
 
-## 配置（唯一必填：api_key）
+## 配置（唯一必填：所选引擎的 api_key）
+
+配置按页签组织：**插件主页**只放开关与下拉；**豆包语音**/**MiMo 语音**各一页改连接与音色；**高级**页收纳数值与路径。
 
 ```toml
-[doubao]
-api_key = "你的火山新版控制台 API Key"   # ← 唯一必填
-resource_id = "seed-tts-2.0"           # 预置音色；复刻音色改 seed-icl-2.0
+[plugin]                      # ── 主页：仅开关与下拉 ──
+enabled = true                # 插件总开关
+tts_engine = "豆包语音"        # 语音引擎：豆包语音 / MiMo 语音（下拉切换）
+emotion = "麦麦自主"           # 情感：麦麦自主（LLM 现场挑，默认）/ 无 / 开心/伤心/生气/…=固定
+emotion_scale = "麦麦自主"     # 情感强度（豆包）：麦麦自主（默认）/ 1~5 固定档位
+command_enabled = true        # /说 /语音 命令开关
+auto_voice_mode = "LLM 自行判断"  # 麦麦自主语音：LLM 自行判断 / 概率触发 / 仅手动
+fallback_to_text = true       # 失败降级发文字
+send_error_prompt = true      # 失败时提示用户
+sync_chat_context = true      # 语音原文写回麦麦上下文（推荐开启）
+follow_segmentation = false   # 跟随分段发语音
+cache_enabled = false         # 本地合成缓存
 
-[voice_tone]
-voice = "小何 2.0"                      # 音色名或 voice_type ID
-emotion = "none"                        # 固定情感：开心/伤心/生气/害怕/惊讶/讨厌/哭泣/抱歉/平静/播音/讲故事
-emotion_scale = 1.0                     # 情感强度 1~5
+[doubao]                      # ── 豆包语音页 ──
+api_key = "你的火山新版控制台 API Key"   # 引擎=豆包语音 时必填
+resource_id = "seed-tts-2.0" # 预置音色；复刻音色改 seed-icl-2.0
+voice = "小何 2.0"            # 音色名或 voice_type ID
+speech_rate = 0              # 语速 -50~100（仅手动）
+loudness = 0                 # 音量 -50~100（仅手动）
 
-[speed_loud]
-speech_rate = 0                         # 语速 -50~100（连续数值，仅手动）
-loudness = 0                            # 音量 -50~100（连续数值，仅手动）
+[mimo]                        # ── MiMo 语音页 ──
+api_key = ""                 # ← 引擎=MiMo 语音 时必填：MiMo 开放平台 API Key（只填 config.toml，勿提交）
+voice_sample = "dxl.wav"     # 复刻音源：相对路径默认在插件 src/ 目录找；wav/mp3、≤10MB
+style = ""                   # 自然语言风格指令（可选）
 
-[behavior]
-command_enabled = true                  # /说 /语音 命令开关
-command_cooldown_seconds = 10           # 同会话语音最小间隔（秒），0=不限流
-auto_voice_mode = "llm"                 # 麦麦自主语音：llm / probability / off
-auto_voice_probability = 0.1            # 概率模式触发概率 0~1（仅 probability）
-emotion_mode = "fixed"                  # 情感来源：fixed / auto（麦麦自主语音时 LLM 现场挑）
-sync_chat_context = true                # 语音原文写回麦麦上下文（推荐开启）
-context_prefix = "[语音]"                # 写回上下文时加的前缀
-cache_enabled = false                   # 本地合成缓存（同文本同音色复用音频）
+[behavior]                    # ── 高级页：数值与路径 ──
+command_cooldown_seconds = 10 # 同会话语音最小间隔（秒），0=不限流
+auto_voice_probability = 0.1  # 概率模式触发概率 0~1（仅 probability）
+timeout_seconds = 30          # 请求超时（秒）
+max_text_length = 150         # 单条最大字数（超过按句切分）
+context_prefix = "[语音]"     # 写回上下文时的前缀
+cache_dir = ""                # 缓存目录；留空 = 宿主插件数据目录下 doubao-tts-cache/
+cache_max_files = 500         # 缓存文件数上限
 ```
 
-全部配置项在 WebUI 插件面板均有中文标签与说明（含跟随分段、缓存目录等次要项），改配置即生效。`config.toml` 含密钥请勿上传，仓库只提供 `config.example.toml`。
+全部配置项在 WebUI 插件面板均有中文标签与说明，改配置即生效。`config.toml` 含密钥请勿上传，仓库只提供 `config.example.toml`。
+
+### MiMo 音色复刻（mimo-v2.5-tts-voiceclone）
+
+1. 把要复刻的音源文件（wav/mp3，≤10MB，越干净越好）放进插件 `src/` 目录（默认文件名 `dxl.wav`），或在 WebUI「MiMo 语音」页把 `voice_sample` 改成其他文件名/绝对路径
+2. 主页「语音引擎」切到 `mimo`；在「MiMo 语音」页填入你自己的 API Key（只写 `config.toml`，已被 .gitignore 排除，勿提交）
+3. 可选：`style` 填一句自然语言风格指令（如「语速稍快，语气亲切自然」）；主页「情感」下拉会转成 `(风格)` 标签叠加在合成文本上
+4. MiMo 每次请求都随音源实时复刻，无需预注册音色；换音源文件立即生效（自动按 mtime 重新读盘）
 
 ### 预置音色（seed-tts-2.0，填音色名即可）
 
@@ -82,6 +103,8 @@ cache_enabled = false                   # 本地合成缓存（同文本同音�
 | 现象 | 处理 |
 | --- | --- |
 | 发 `/说` 后收到的是文字（没语音） | 合成失败已降级为文字。最常见是音色与资源不匹配（见"适用边界"），改对后日志显示 `合成成功` |
+| MiMo 报 401 / 未返回音频 | api_key 未填或无效，或音源不可用；看日志 `[MiMoTTS]` 具体错误 |
+| 提示"复刻音源不可用" | `voice_sample` 路径不对：默认在插件 `src/` 目录下找 `dxl.wav`，或填绝对路径；仅支持 wav/mp3、≤10MB |
 | HTTP 401 / 鉴权失败 | api_key 填错，或账号未开通豆包语音服务 |
 | 说话没声音/失败 | 平台适配器不支持语音消息通道；看日志 `[豆包TTS]` 具体错误 |
 | 语音失败后反复报错 | 失败提示同一会话 30 秒只发一次；冷却期内（默认 10 秒）重试必定失败，属预期 |

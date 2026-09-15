@@ -1,11 +1,14 @@
-"""豆包语音合成插件（Doubao TTS）
+"""豆包/MiMo 语音合成插件（Doubao & MiMo TTS）
 
-让麦麦能用豆包语音（火山引擎 · 语音合成大模型）说话。
+让麦麦能用豆包语音（火山引擎 · 语音合成大模型）或小米 MiMo 语音（音色复刻）说话。
 
 - 手动触发：发送 ``/说 文本`` / ``/语音 文本`` / ``/speak 文本``，麦麦把文本转语音发到当前会话；
-- 麦麦自主触发：插件注册一个 Tool「speak_text」，LLM 在合适时机（用户要求用语音时）调用它；
-- 音色：内置火山官方预置音色清单（按名字选即可），也支持直接填 voice_type 音色 ID 或复刻音色 ID；
-- 鉴权：火山引擎**新版控制台** API Key（X-Api-Key 单头鉴权），无需旧版 App ID / Access Token。
+- 麦麦自主触发：插件注册一个 Tool「doubao_tts_speak」，LLM 在合适时机（用户要求用语音时）调用它；
+- 双引擎：配置主页「语音引擎」下拉切换——
+  * doubao：火山官方预置音色清单（按名字选即可），也支持直接填 voice_type 音色 ID 或复刻音色 ID；
+  * mimo：小米 MiMo ``mimo-v2.5-tts-voiceclone`` 音色复刻，把 wav/mp3 音源放进插件 ``src/`` 即可开口；
+- 配置分页：主页只放开关与下拉选择；豆包 / MiMo 各一个页签改连接与音色；数值与路径归「高级」页；
+- 鉴权：豆包用火山引擎新版控制台 API Key（X-Api-Key 单头鉴权）；MiMo 用开放平台 API Key（Bearer）。
 
 独立实现；功能组织参考了 xuqian13/tts_voice_plugin，代码不共用（致谢见 README）。
 """
@@ -26,13 +29,23 @@ from pydantic import field_validator
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, ToolParameterInfo
 
-SUPPORTED_CONFIG_VERSION = "1.4.0"
+SUPPORTED_CONFIG_VERSION = "1.6.0"
 ERROR_PROMPT_DEDUPE_SECONDS = 30.0
 """同一会话失败提示的去重窗口（秒）：LLM 对失败有重试倾向，去重防提示刷屏。"""
+PLUGIN_DIR = Path(__file__).resolve().parent
+PLUGIN_SRC_DIR = PLUGIN_DIR / "src"
+
 # ─── 火山引擎 API ────────────────────────────────────────────────────────────
 DOUBAO_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 DOUBAO_RESOURCE_PRESET = "seed-tts-2.0"   # 预置音色（语音合成模型 2.0）
 DOUBAO_RESOURCE_CLONE = "seed-icl-2.0"    # 复刻音色（声音复刻模型 2.0）
+
+# ─── 小米 MiMo API（音色复刻）────────────────────────────────────────────────
+MIMO_TTS_URL = "https://api.xiaomimimo.com/v1/chat/completions"
+MIMO_MODEL = "mimo-v2.5-tts-voiceclone"   # 音色复刻模型
+MIMO_VOICE_SAMPLE_DEFAULT = "dxl.wav"     # 默认音源：插件 src/ 目录下的 dxl.wav
+MIMO_MAX_SAMPLE_BYTES = 10 * 1024 * 1024  # 官方限制：音源样本 ≤ 10MB
+MIMO_SAMPLE_MIME = {".wav": "audio/wav", ".mp3": "audio/mpeg"}
 
 # 官方预置音色（voice_type 以 _uranus_bigtts 结尾，配 seed-tts-2.0）
 # 配置里可直接写“显示名”，也可直接填任意 voice_type 音色 ID
@@ -68,6 +81,25 @@ PRESET_EMOTIONS: Dict[str, str] = {
 
 # 默认音色
 DEFAULT_VOICE_DISPLAY = "小何 2.0"
+
+# MiMo 风格标签：主页「情感」下拉值 → (风格) 标签（MiMo 支持自定义风格，未列出的原样透传）
+MIMO_EMOTION_TAGS: Dict[str, str] = {
+    "开心": "开心",
+    "伤心": "悲伤",
+    "生气": "愤怒",
+    "害怕": "恐惧",
+    "惊讶": "惊讶",
+    "讨厌": "冷漠",
+    "哭泣": "哽咽",
+    "抱歉": "愧疚",
+    "平静": "平静",
+    "播音": "播音",
+    "讲故事": "讲故事",
+}
+
+# 主页「情感」「情感强度」下拉的特殊选项值（SDK 的下拉直接显示 Literal 值，故用中文）
+EMOTION_AUTO = "麦麦自主"  # LLM 按对话氛围现场挑
+EMOTION_NONE = "无"        # 不带情感（正常语气）
 
 
 def _resolve_voice_type(voice: str) -> str:
@@ -116,11 +148,56 @@ def _split_sentences(text: str, max_len: int) -> List[str]:
 
 
 class PluginSectionConfig(PluginConfigBase):
-    """插件基础配置。"""
+    """插件主页配置：只放开关与下拉选择，具体数值/密钥到各引擎页签改。"""
 
-    __ui_label__ = "插件"
+    __ui_label__ = "插件主页"
     __ui_icon__ = "package"
     __ui_order__ = 0
+
+    # ── 兼容旧配置的归一化（下拉值已全中文化，旧英文值自动映射）─────────
+    @field_validator("tts_engine", mode="before")
+    @classmethod
+    def _normalize_tts_engine(cls, v: Any) -> Any:
+        """旧配置 doubao/mimo 英文值 → 中文选项值。"""
+        s = str(v or "").strip().lower()
+        if "mimo" in s:
+            return "MiMo 语音"
+        return "豆包语音"
+
+    @field_validator("emotion", mode="before")
+    @classmethod
+    def _normalize_emotion(cls, v: Any) -> Any:
+        """旧配置空串/"none" → "无"；"auto" → "麦麦自主"。"""
+        s = str(v or "").strip()
+        if s in ("", "none"):
+            return EMOTION_NONE
+        if s == "auto":
+            return EMOTION_AUTO
+        return v
+
+    @field_validator("emotion_scale", mode="before")
+    @classmethod
+    def _normalize_emotion_scale(cls, v: Any) -> Any:
+        """旧配置数值档位 → 字符串；"auto" → "麦麦自主"。"""
+        if v is None:
+            return EMOTION_AUTO
+        if isinstance(v, (int, float)):
+            return str(int(v)) if 1 <= int(v) <= 5 else EMOTION_AUTO
+        s = str(v).strip()
+        return EMOTION_AUTO if s in ("", "auto") else s
+
+    @field_validator("auto_voice_mode", mode="before")
+    @classmethod
+    def _normalize_auto_voice_mode(cls, v: Any) -> Any:
+        """旧配置 llm/probability/off 英文值 → 中文选项值。"""
+        s = str(v or "").strip().lower()
+        if not s or "llm" in s:
+            return "LLM 自行判断"
+        if "概率" in s or s == "probability":
+            return "概率触发"
+        if "手动" in s or "关闭" in s or s == "off":
+            return "仅手动"
+        return v
 
     enabled: bool = Field(
         default=True,
@@ -132,123 +209,22 @@ class PluginSectionConfig(PluginConfigBase):
         description="配置版本（勿改）",
         json_schema_extra={"hidden": True, "disabled": True},
     )
-
-
-class DoubaoSectionConfig(PluginConfigBase):
-    """豆包语音 API 连接配置。"""
-
-    __ui_label__ = "豆包语音"
-    __ui_icon__ = "plug"
-    __ui_order__ = 1
-
-    api_key: str = Field(
-        default="",
-        description="火山引擎新版控制台 API Key（控制台→豆包语音→API Key 管理）。敏感信息，勿随插件分发",
-        json_schema_extra={"label": "API Key", "secret": True, "hint": "火山引擎新版控制台 → 豆包语音 → API Key 管理；敏感信息，勿外传"},
-    )
-    resource_id: str = Field(
-        default=DOUBAO_RESOURCE_PRESET,
-        description="资源 ID：seed-tts-2.0=预置音色（默认）；seed-icl-2.0=复刻音色。可直接填这两个常用值，也支持填其他资源 ID",
+    tts_engine: Literal["豆包语音", "MiMo 语音"] = Field(
+        default="豆包语音",
+        description="语音引擎：豆包语音=火山（官方预置音色库 + 复刻音色）；MiMo 语音=小米音色复刻（mimo-v2.5-tts-voiceclone，音源放插件 src/）",
         json_schema_extra={
-            "label": "Resource ID",
-            "placeholder": "seed-tts-2.0 或 seed-icl-2.0",
-            "example": "seed-tts-2.0",
-            "hint": "常用值：seed-tts-2.0（官方预置音色）｜seed-icl-2.0（复刻音色）。想用其他资源 ID 直接填入即可",
+            "label": "语音引擎",
+            "hint": "切换引擎后，到对应页签填 API Key 等连接配置",
         },
     )
-    audio_format: str = Field(
-        default="mp3",
-        description="音频编码格式：mp3（推荐）/ ogg_opus",
-        json_schema_extra={"label": "音频格式", "hidden": True},
-    )
-    sample_rate: int = Field(
-        default=24000,
-        description="采样率 Hz（默认 24000）",
-        json_schema_extra={"label": "采样率", "hidden": True},
-    )
-
-
-class VoiceToneSectionConfig(PluginConfigBase):
-    """音色与情感配置。"""
-
-    __ui_label__ = "音色与情感"
-    __ui_icon__ = "music"
-    __ui_order__ = 2
-
-    @field_validator("emotion", mode="before")
-    @classmethod
-    def _normalize_emotion(cls, v: Any) -> Any:
-        """兼容旧配置：把空字符串归一化为 'none'（下拉不允许空串选项，历史保存值可能为 ""）。"""
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            return "none"
-        return v
-
-    voice: str = Field(
-        default=DEFAULT_VOICE_DISPLAY,
-        description="音色：预置音色显示名（见 README 音色表）或直接填 voice_type 音色 ID",
+    emotion: Literal["麦麦自主", "无", "开心", "伤心", "生气", "害怕", "惊讶", "讨厌", "哭泣", "抱歉", "平静", "播音", "讲故事"] = Field(
+        default="麦麦自主",
+        description="情感：麦麦自主=LLM 按对话氛围现场挑（推荐）；选具体情感=固定用它（手动 /说 与自主语音一致）；无=正常语气。豆包走情感参数；MiMo 转成 (风格) 标签",
         json_schema_extra={
-            "label": "音色",
-            "placeholder": "小何 2.0 / Vivi 2.0 / 云舟 2.0 或 voice_type ID",
-            "hint": "常用预置音色：小何 2.0、Vivi 2.0、爽快思思 2.0、甜美小源 2.0、云舟 2.0…完整列表见 README",
+            "label": "情感",
+            "hint": "麦麦自主=LLM 现场挑｜无=正常语气｜其余=固定情感",
         },
     )
-    emotion: Literal["none", "开心", "伤心", "生气", "害怕", "惊讶", "讨厌", "哭泣", "抱歉", "平静", "播音", "讲故事"] = Field(
-        default="none",
-        description="情感语气：选一个固定情感（默认“无”=正常语气）。若行为页 emotion_mode=auto，则麦麦自主语音时由 LLM 现场挑，本值仅用于手动 /说 与 fixed 模式",
-        json_schema_extra={
-            "label": "情感（可自主）",
-            "options": {
-                "none": {"label": "无（正常语气）", "description": "不带情感，最自然的播报语气"},
-                "开心": {"label": "开心", "description": "欢乐上扬的语气"},
-                "伤心": {"label": "伤心", "description": "低落难过的语气"},
-                "生气": {"label": "生气", "description": "不满或愤怒的语气"},
-                "害怕": {"label": "害怕", "description": "紧张害怕的语气"},
-                "惊讶": {"label": "惊讶", "description": "吃惊意外的语气"},
-                "讨厌": {"label": "讨厌", "description": "嫌弃反感的语气"},
-                "哭泣": {"label": "哭泣", "description": "带着哭腔"},
-                "抱歉": {"label": "抱歉", "description": "歉意诚恳的语气"},
-                "平静": {"label": "平静", "description": "沉稳温和、适合安慰"},
-                "播音": {"label": "播音", "description": "字正腔圆的播音腔"},
-                "讲故事": {"label": "讲故事", "description": "娓娓道来、适合朗读故事"},
-            },
-            "hint": "固定情感（默认“无”）；行为页「情感来源」设为 auto 时，麦麦自主语音会自己挑",
-        },
-    )
-    emotion_scale: float = Field(
-        default=1.0,
-        ge=1.0,
-        le=5.0,
-        description="情感强度 1~5（配合情感使用，1=最淡）。若行为页 emotion_scale_mode=auto，麦麦自主时由 LLM 按情感挑",
-        json_schema_extra={"label": "情感强度（可自主）", "hint": "1~5，1=最淡；行为页「情感强度来源」设为 auto 时麦麦自己挑"},
-    )
-
-
-class SpeedLoudSectionConfig(PluginConfigBase):
-    """语速与音量配置（火山固定连续数值，仅手动设置）。"""
-
-    __ui_label__ = "语速与音量"
-    __ui_icon__ = "gauge"
-    __ui_order__ = 3
-
-    speech_rate: float = Field(
-        default=0.0,
-        description="语速 -50~100（0=正常）。火山固定连续数值，麦麦不可自主，仅手动设置",
-        json_schema_extra={"label": "语速（仅手动）", "hint": "-50~100，0=正常；此值麦麦不能自主调节"},
-    )
-    loudness: float = Field(
-        default=0.0,
-        description="音量 -50~100（0=正常）。火山固定连续数值，麦麦不可自主，仅手动设置",
-        json_schema_extra={"label": "音量（仅手动）", "hint": "-50~100，0=正常；此值麦麦不能自主调节"},
-    )
-
-
-class BehaviorSectionConfig(PluginConfigBase):
-    """行为配置。"""
-
-    __ui_label__ = "行为"
-    __ui_icon__ = "sliders"
-    __ui_order__ = 4
-
     command_enabled: bool = Field(
         default=True,
         description=(
@@ -257,66 +233,21 @@ class BehaviorSectionConfig(PluginConfigBase):
         ),
         json_schema_extra={"label": "手动命令", "hint": "只影响 /说 /语音 手动命令；麦麦自主语音由下方「自主语音方式」控制"},
     )
-    command_cooldown_seconds: float = Field(
-        default=10.0,
-        ge=0.0,
-        description=(
-            "同一会话两次语音合成的最小间隔（秒），0=不限流。"
-            "防止刷屏与刷费用；对手动命令与麦麦自主 Tool 调用一并生效"
-        ),
-        json_schema_extra={"label": "语音冷却（秒）", "hint": "同一会话两次合成语音的最小间隔，0=不限流；命令与自主语音都受限"},
-    )
-    auto_voice_mode: Literal["llm", "probability", "off"] = Field(
-        default="llm",
-        description="麦麦自主语音方式：llm=由 LLM 自行判断何时用语音（推荐）；probability=按概率偶尔语音（不依赖 LLM）；off=麦麦不自主，仅手动命令",
+    auto_voice_mode: Literal["LLM 自行判断", "概率触发", "仅手动"] = Field(
+        default="LLM 自行判断",
+        description="麦麦自主语音方式：LLM 自行判断=由 LLM 决定何时用语音（推荐）；概率触发=每条消息按概率掷骰，命中则本轮回复转语音（频率在「高级」页的概率值控制）；仅手动=只有 /说 /语音 命令才发声",
         json_schema_extra={
             "label": "自主语音方式",
-            "options": {
-                "llm": {"label": "LLM 自行判断（推荐）", "description": "麦麦自己决定何时用语音：你叫它说、或它觉得适合时都会用"},
-                "probability": {"label": "概率触发", "description": "麦麦不靠判断，每收一条消息按概率掷骰，命中则本轮回复转语音（频率由下方概率值精确控制）"},
-                "off": {"label": "关闭（仅手动）", "description": "麦麦从不主动语音，只有 /说 /语音 命令才会发声"},
-            },
-            "hint": "llm=麦麦自己决定何时语音｜probability=每条消息掷骰，命中则回复转语音｜off=仅手动 /说",
+            "hint": "LLM 自行判断（推荐）｜概率触发｜仅手动",
         },
     )
-    auto_voice_probability: float = Field(
-        default=0.1,
-        description="概率模式的触发概率 0~1（0.1=平均每 10 轮约 1 轮语音；0=关）。仅 auto_voice_mode=probability 时生效",
-        json_schema_extra={"label": "语音概率", "hint": "0~1；0.1=平均每 10 轮约 1 轮语音，仅「概率触发」模式下生效"},
-    )
-    emotion_mode: Literal["fixed", "auto"] = Field(
-        default="fixed",
-        description="情感参数来源：fixed=用 [doubao] emotion 固定值（默认）；auto=麦麦自主语音时由 LLM 现场挑情感（手动 /说 仍用固定值）",
+    emotion_scale: Literal["麦麦自主", "1", "2", "3", "4", "5"] = Field(
+        default="麦麦自主",
+        description="情感强度 1~5（豆包专用）：麦麦自主=LLM 按情感挑档位（推荐，LLM 未给时不下发）；固定档位=1 最淡…5 最浓",
         json_schema_extra={
-            "label": "情感来源",
-            "options": {
-                "fixed": {"label": "固定（手动设置）", "description": "始终用上方 [doubao] emotion 的值"},
-                "auto": {"label": "麦麦自主", "description": "麦麦自主语音（llm 模式）时由 LLM 结合氛围现场挑"},
-            },
-            "hint": "fixed=手动 /说 用上方固定情感｜auto=麦麦自主语音时自己挑情感",
+            "label": "情感强度（豆包）",
+            "hint": "麦麦自主=LLM 挑｜1=最淡 … 5=最浓；仅「情感」生效时随情感一起下发",
         },
-    )
-    emotion_scale_mode: Literal["fixed", "auto"] = Field(
-        default="fixed",
-        description="情感强度来源：fixed=用 [doubao] emotion_scale 固定值；auto=麦麦自主时由 LLM 按情感档位挑（1~5）",
-        json_schema_extra={
-            "label": "情感强度来源",
-            "options": {
-                "fixed": {"label": "固定（手动设置）", "description": "始终用上方 [doubao] emotion_scale 的值"},
-                "auto": {"label": "麦麦自主", "description": "麦麦自主语音时由 LLM 按情感挑强度 1~5"},
-            },
-            "hint": "fixed=用上方固定强度｜auto=麦麦自主语音时自己挑强度（1~5）",
-        },
-    )
-    timeout_seconds: float = Field(
-        default=30.0,
-        description="请求火山接口超时（秒）",
-        json_schema_extra={"label": "超时（秒）", "hint": "单次合成请求的最长等待时间"},
-    )
-    max_text_length: int = Field(
-        default=150,
-        description="单条语音最大文本长度（超过按句切分多条发送）",
-        json_schema_extra={"label": "单条最大字数", "hint": "超过就按句子切成多条语音依次发"},
     )
     fallback_to_text: bool = Field(
         default=True,
@@ -354,10 +285,139 @@ class BehaviorSectionConfig(PluginConfigBase):
     cache_enabled: bool = Field(
         default=False,
         description=(
-            "把合成结果缓存到本地：同样的文本+音色+情感+语速直接复用音频，"
-            "不重复调用火山接口（省钱、省等待）"
+            "把合成结果缓存到本地：同样的文本+音色+情感直接复用音频，"
+            "不重复调用接口（省钱、省等待）"
         ),
-        json_schema_extra={"label": "本地合成缓存", "hint": "同文本同音色直接复用本地音频，不再调火山接口"},
+        json_schema_extra={"label": "本地合成缓存", "hint": "同文本同音色直接复用本地音频，不再调 TTS 接口；缓存目录等在「高级」页"},
+    )
+
+
+class DoubaoSectionConfig(PluginConfigBase):
+    """豆包语音（火山引擎）连接与音色配置。"""
+
+    __ui_label__ = "豆包语音"
+    __ui_icon__ = "plug"
+    __ui_order__ = 1
+
+    api_key: str = Field(
+        default="",
+        description="火山引擎新版控制台 API Key（控制台→豆包语音→API Key 管理）。敏感信息，勿随插件分发",
+        json_schema_extra={"label": "API Key", "secret": True, "hint": "火山引擎新版控制台 → 豆包语音 → API Key 管理；敏感信息，勿外传"},
+    )
+    resource_id: str = Field(
+        default=DOUBAO_RESOURCE_PRESET,
+        description="资源 ID：seed-tts-2.0=预置音色（默认）；seed-icl-2.0=复刻音色。可直接填这两个常用值，也支持填其他资源 ID",
+        json_schema_extra={
+            "label": "Resource ID",
+            "placeholder": "seed-tts-2.0 或 seed-icl-2.0",
+            "example": "seed-tts-2.0",
+            "hint": "常用值：seed-tts-2.0（官方预置音色）｜seed-icl-2.0（复刻音色）。想用其他资源 ID 直接填入即可",
+        },
+    )
+    voice: str = Field(
+        default=DEFAULT_VOICE_DISPLAY,
+        description="音色：预置音色显示名（见 README 音色表）或直接填 voice_type 音色 ID",
+        json_schema_extra={
+            "label": "音色",
+            "placeholder": "小何 2.0 / Vivi 2.0 / 云舟 2.0 或 voice_type ID",
+            "hint": "常用预置音色：小何 2.0、Vivi 2.0、爽快思思 2.0、甜美小源 2.0、云舟 2.0…完整列表见 README",
+        },
+    )
+    speech_rate: float = Field(
+        default=0.0,
+        description="语速 -50~100（0=正常，豆包专用）。火山固定连续数值，麦麦不可自主，仅手动设置",
+        json_schema_extra={"label": "语速（豆包·仅手动）", "hint": "-50~100，0=正常；此值麦麦不能自主调节"},
+    )
+    loudness: float = Field(
+        default=0.0,
+        description="音量 -50~100（0=正常，豆包专用）。火山固定连续数值，麦麦不可自主，仅手动设置",
+        json_schema_extra={"label": "音量（豆包·仅手动）", "hint": "-50~100，0=正常；此值麦麦不能自主调节"},
+    )
+    audio_format: str = Field(
+        default="mp3",
+        description="音频编码格式：mp3（推荐）/ ogg_opus",
+        json_schema_extra={"label": "音频格式", "hidden": True},
+    )
+    sample_rate: int = Field(
+        default=24000,
+        description="采样率 Hz（默认 24000）",
+        json_schema_extra={"label": "采样率", "hidden": True},
+    )
+
+
+class MimoSectionConfig(PluginConfigBase):
+    """小米 MiMo 语音（音色复刻）连接与音源配置。"""
+
+    __ui_label__ = "MiMo 语音"
+    __ui_icon__ = "mic"
+    __ui_order__ = 2
+
+    api_key: str = Field(
+        default="",
+        description="MiMo 开放平台 API Key（mimo.mi.com → API Key 管理）。敏感信息，勿随插件分发、勿提交到仓库",
+        json_schema_extra={
+            "label": "API Key",
+            "secret": True,
+            "placeholder": "sk-...",
+            "hint": "获取：MiMo 开放平台（mimo.mi.com）→ API Key；敏感信息，勿外传",
+        },
+    )
+    voice_sample: str = Field(
+        default=MIMO_VOICE_SAMPLE_DEFAULT,
+        description="复刻音源文件：默认 dxl.wav，相对路径自动在插件 src/ 目录下找；也可填绝对路径。仅支持 wav/mp3，≤10MB",
+        json_schema_extra={
+            "label": "复刻音源文件",
+            "placeholder": "dxl.wav",
+            "example": "dxl.wav",
+            "hint": "相对路径默认在插件 src/ 文件夹里找（默认 dxl.wav）；换音色就把 wav/mp3 放进 src/ 或填绝对路径",
+        },
+    )
+    style: str = Field(
+        default="",
+        description="自然语言风格指令（可选）：如「语速稍快，声音明亮，语气亲切自然」，作为 user 指令传给 MiMo 调整语气",
+        json_schema_extra={
+            "label": "风格指令（可选）",
+            "placeholder": "例：语速稍快，声音明亮，语气亲切自然",
+            "hint": "留空=不传；主页「情感」下拉会转成 (风格) 标签叠加生效",
+        },
+    )
+    audio_format: str = Field(
+        default="wav",
+        description="音频编码格式（MiMo 固定 wav，勿改）",
+        json_schema_extra={"label": "音频格式", "hidden": True},
+    )
+
+
+class BehaviorSectionConfig(PluginConfigBase):
+    """高级配置：数值与路径类（主页只放开关与下拉，这里收纳其余细项）。"""
+
+    __ui_label__ = "高级（数值与路径）"
+    __ui_icon__ = "sliders"
+    __ui_order__ = 3
+
+    command_cooldown_seconds: float = Field(
+        default=10.0,
+        ge=0.0,
+        description=(
+            "同一会话两次语音合成的最小间隔（秒），0=不限流。"
+            "防止刷屏与刷费用；对手动命令与麦麦自主 Tool 调用一并生效"
+        ),
+        json_schema_extra={"label": "语音冷却（秒）", "hint": "同一会话两次合成语音的最小间隔，0=不限流；命令与自主语音都受限"},
+    )
+    auto_voice_probability: float = Field(
+        default=0.1,
+        description="概率模式的触发概率 0~1（0.1=平均每 10 轮约 1 轮语音；0=关）。仅主页「自主语音方式」=probability 时生效",
+        json_schema_extra={"label": "语音概率", "hint": "0~1；0.1=平均每 10 轮约 1 轮语音，仅「概率触发」模式下生效"},
+    )
+    timeout_seconds: float = Field(
+        default=30.0,
+        description="请求 TTS 接口超时（秒，豆包/MiMo 通用）",
+        json_schema_extra={"label": "超时（秒）", "hint": "单次合成请求的最长等待时间"},
+    )
+    max_text_length: int = Field(
+        default=150,
+        description="单条语音最大文本长度（超过按句切分多条发送）",
+        json_schema_extra={"label": "单条最大字数", "hint": "超过就按句子切成多条语音依次发"},
     )
     cache_dir: str = Field(
         default="",
@@ -385,20 +445,52 @@ class BehaviorSectionConfig(PluginConfigBase):
 class DoubaoTTSRootConfig(PluginConfigBase):
     """插件根配置。"""
 
-    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig, json_schema_extra={"label": "插件"})
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig, json_schema_extra={"label": "插件主页"})
     doubao: DoubaoSectionConfig = Field(default_factory=DoubaoSectionConfig, json_schema_extra={"label": "豆包语音"})
-    voice_tone: VoiceToneSectionConfig = Field(default_factory=VoiceToneSectionConfig, json_schema_extra={"label": "音色与情感"})
-    speed_loud: SpeedLoudSectionConfig = Field(default_factory=SpeedLoudSectionConfig, json_schema_extra={"label": "语速与音量"})
-    behavior: BehaviorSectionConfig = Field(default_factory=BehaviorSectionConfig, json_schema_extra={"label": "行为"})
+    mimo: MimoSectionConfig = Field(default_factory=MimoSectionConfig, json_schema_extra={"label": "MiMo 语音"})
+    behavior: BehaviorSectionConfig = Field(default_factory=BehaviorSectionConfig, json_schema_extra={"label": "高级"})
 
 
 # ─── 主插件 ──────────────────────────────────────────────────────────────────
 
 
 class DoubaoTTSPlugin(MaiBotPlugin):
-    """豆包语音合成插件：文字转语音，让麦麦开口说话。"""
+    """豆包/MiMo 语音合成插件：文字转语音，让麦麦开口说话。"""
 
     config_model = DoubaoTTSRootConfig
+
+    # ── WebUI 配置页标签布局 ────────────────────────────────────────────
+    # SDK 默认 layout=auto（所有 section 堆叠在一页）；这里覆盖 build_config_schema，
+    # 把 layout 改写为 tabs——主页/豆包语音/MiMo 语音/高级 各占一个可切换页签。
+    # WebUI 端按 schema.layout.type === "tabs" 渲染 Tabs（见 dashboard plugin-config.tsx）。
+    @classmethod
+    def build_config_schema(
+        cls,
+        *,
+        plugin_id: str = "",
+        plugin_name: str = "",
+        plugin_version: str = "",
+        plugin_description: str = "",
+        plugin_author: str = "",
+    ) -> Dict[str, Any]:
+        schema = super().build_config_schema(
+            plugin_id=plugin_id,
+            plugin_name=plugin_name,
+            plugin_version=plugin_version,
+            plugin_description=plugin_description,
+            plugin_author=plugin_author,
+        )
+        if isinstance(schema, dict) and schema.get("sections"):
+            schema["layout"] = {
+                "type": "tabs",
+                "tabs": [
+                    {"id": "main", "title": "主页", "sections": ["plugin"], "order": 0},
+                    {"id": "doubao", "title": "豆包语音", "sections": ["doubao"], "order": 1},
+                    {"id": "mimo", "title": "MiMo 语音", "sections": ["mimo"], "order": 2},
+                    {"id": "advanced", "title": "高级", "sections": ["behavior"], "order": 3},
+                ],
+            }
+        return schema
 
     def __init__(self) -> None:
         super().__init__()
@@ -410,6 +502,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self._last_speech_at: Dict[str, float] = {}
         # 会话 → 上次失败提示时间戳（30 秒去重，防 LLM 重试导致提示刷屏）
         self._last_error_prompt_at: Dict[str, float] = {}
+        # MiMo 音源缓存：(文件路径, mtime_ns, dataURL)——文件没变就不重复读盘/编码
+        self._mimo_sample_cache: Optional[Tuple[str, int, str]] = None
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -419,8 +513,60 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         except Exception:
             return default
 
-    def _api_key(self) -> str:
+    def _engine(self) -> str:
+        """当前语音引擎：doubao（默认）/ mimo。兼容中英文配置值。"""
+        try:
+            raw = str(self._get("plugin", "tts_engine", "") or "").strip().lower()
+        except Exception:
+            return "doubao"
+        return "mimo" if "mimo" in raw else "doubao"
+
+    def _engine_name(self) -> str:
+        return "MiMo" if self._engine() == "mimo" else "豆包"
+
+    def _doubao_api_key(self) -> str:
         return str(self._get("doubao", "api_key", "") or "").strip()
+
+    def _mimo_api_key(self) -> str:
+        return str(self._get("mimo", "api_key", "") or "").strip()
+
+    def _active_api_key(self) -> str:
+        """当前引擎的 API Key。"""
+        return self._mimo_api_key() if self._engine() == "mimo" else self._doubao_api_key()
+
+    # ── MiMo 音色复刻音源 ───────────────────────────────────────────────
+
+    def _mimo_voice_data_url(self) -> Tuple[Optional[str], str]:
+        """把配置的音源文件读成 DataURL（data:audio/xxx;base64,...）。
+
+        相对路径依次在插件 src/ 目录、插件根目录、当前工作目录下找；
+        绝对路径直接用。带 mtime 缓存，文件没变不重复读盘。
+
+        Returns:
+            (dataURL 或 None, 音源文件名或错误说明)
+        """
+        raw = str(self._get("mimo", "voice_sample", MIMO_VOICE_SAMPLE_DEFAULT) or "").strip() or MIMO_VOICE_SAMPLE_DEFAULT
+        p = Path(raw)
+        candidates = [p] if p.is_absolute() else [PLUGIN_SRC_DIR / raw, PLUGIN_DIR / raw, p]
+        path = next((c for c in candidates if c.is_file()), None)
+        if path is None:
+            return None, f"{raw}（把音源文件放进插件 src/ 目录，或填绝对路径）"
+        mime = MIMO_SAMPLE_MIME.get(path.suffix.lower())
+        if not mime:
+            return None, f"{path.name}（不支持的格式 {path.suffix}，仅支持 wav/mp3）"
+        try:
+            stat = path.stat()
+            cached = self._mimo_sample_cache
+            if cached and cached[0] == str(path) and cached[1] == stat.st_mtime_ns:
+                return cached[2], path.name
+            data = path.read_bytes()
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{path.name}（读取失败: {exc}）"
+        if len(data) > MIMO_MAX_SAMPLE_BYTES:
+            return None, f"{path.name}（超过官方 10MB 上限，请裁剪音源）"
+        data_url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        self._mimo_sample_cache = (str(path), stat.st_mtime_ns, data_url)
+        return data_url, path.name
 
     # ── 冷却限流 ────────────────────────────────────────────────────────
 
@@ -452,7 +598,47 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     # ── 概率自主语音 ────────────────────────────────────────────────────
 
     def _auto_voice_mode(self) -> str:
-        return str(self._get("behavior", "auto_voice_mode", "llm") or "llm").strip().lower()
+        """麦麦自主语音方式：llm / probability / off（兼容中英文配置值）。"""
+        try:
+            raw = str(self._get("plugin", "auto_voice_mode", "") or "").strip().lower()
+        except Exception:
+            return "llm"
+        if "概率" in raw or raw == "probability":
+            return "probability"
+        if "手动" in raw or "关闭" in raw or raw == "off":
+            return "off"
+        return "llm"
+
+    def _fixed_emotion(self, overrides: Dict[str, Any]) -> str:
+        """解析本次合成使用的情感（空串=不带固定情感）。
+
+        LLM 覆盖（overrides.emotion）优先；否则取主页「情感」固定值，
+        仅当它是具体情感（非"麦麦自主"/"无"）时返回。
+        """
+        emotion = str(overrides.get("emotion") or "").strip()
+        if not emotion or emotion == EMOTION_NONE:
+            fixed = str(self._get("plugin", "emotion", "") or "").strip()
+            if fixed and fixed not in (EMOTION_NONE, EMOTION_AUTO, "none", "auto"):
+                return fixed
+            return ""
+        return emotion
+
+    def _fixed_emotion_scale(self, overrides: Dict[str, Any]) -> Optional[float]:
+        """解析本次合成使用的情感强度 1~5（豆包专用）。
+
+        LLM 覆盖（overrides.emotion_scale）优先；否则取主页「情感强度」固定档位；
+        "麦麦自主"且 LLM 未给时返回 None=不下发该参数。
+        """
+        raw = overrides.get("emotion_scale")
+        if raw is None:
+            raw = str(self._get("plugin", "emotion_scale", "") or "").strip()
+            if not raw or raw == EMOTION_AUTO:
+                return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if 1.0 <= val <= 5.0 else None
 
     def _probability_enabled(self) -> bool:
         if self._auto_voice_mode() != "probability":
@@ -554,7 +740,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         text, _ = await self._extract_message_text(message)
         if not text:
             return {"action": "continue"}
-        follow = self._get("behavior", "follow_segmentation", False)
+        follow = self._get("plugin", "follow_segmentation", False)
         if not follow:
             # 不跟随分段：只转第一条，消费掉标记
             self._pending_voice.pop(session_id, None)
@@ -580,7 +766,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         分段插件的补发、宿主的后处理都不会被打断，语音也就跟着文本一段一段发。
         合成失败时返回 continue，让原文照常发出，不会丢内容。
         """
-        if not self._api_key():
+        if not self._active_api_key():
             self.ctx.logger.warning("[豆包TTS] 未配置 API Key，本条保持文字")
             return {"action": "continue"}
 
@@ -611,23 +797,31 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             "[豆包TTS] 会话 %s 已把该段文字换成 %d 条语音（跟随分段）", session_id, len(voice_segments)
         )
         # 语音本身不带文字，另外把原文补进对话上下文
-        if self._get("behavior", "sync_chat_context", True):
+        if self._get("plugin", "sync_chat_context", True):
             await self._append_chat_context(session_id, text)
         return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
 
     # ── 生命周期 ────────────────────────────────────────────────────────
 
     async def on_load(self) -> None:
-        key_state = "已配置" if self._api_key() else "未配置"
+        engine = self._engine()
+        key_state = "已配置" if self._active_api_key() else "未配置"
+        if engine == "mimo":
+            _, vinfo = self._mimo_voice_data_url()
+            detail = f" | 复刻音源: {vinfo}"
+        else:
+            detail = (
+                f" | 音色: {self._get('doubao', 'voice', DEFAULT_VOICE_DISPLAY)}"
+                f" | resource: {self._get('doubao', 'resource_id', DOUBAO_RESOURCE_PRESET)}"
+            )
         self.ctx.logger.info(
-            "[豆包TTS] 插件已加载 | API Key: %s | 音色: %s | resource: %s",
-            key_state,
-            self._get("voice_tone", "voice", DEFAULT_VOICE_DISPLAY),
-            self._get("doubao", "resource_id", DOUBAO_RESOURCE_PRESET),
+            "[豆包TTS] 插件已加载 | 引擎: %s | API Key: %s%s",
+            self._engine_name(), key_state, detail,
         )
-        if not self._api_key():
+        if not self._active_api_key():
             self.ctx.logger.warning(
-                "[豆包TTS] 尚未配置 API Key：请在插件配置 [doubao] api_key 填写火山引擎新版控制台的 API Key"
+                "[豆包TTS] 尚未配置 API Key：请在插件配置「%s」页填写",
+                "MiMo 语音" if engine == "mimo" else "豆包语音",
             )
 
     async def on_unload(self) -> None:
@@ -645,7 +839,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         doubao-tts-cache/——运行时数据不写启动目录；拿不到该目录时退回
         相对路径旧行为。
         """
-        if not bool(self._get("behavior", "cache_enabled", False)):
+        if not bool(self._get("plugin", "cache_enabled", False)):
             return None
         raw = str(self._get("behavior", "cache_dir", "") or "").strip()
         if raw:
@@ -670,6 +864,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
     def _cache_ext(self) -> str:
+        if self._engine() == "mimo":
+            return "wav"
         return str(self._get("doubao", "audio_format", "mp3")).strip().lstrip(".") or "mp3"
 
     def _cache_lookup(self, cache_key: str, cache_dir: Path) -> Optional[bytes]:
@@ -719,27 +915,44 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     async def _synthesize_one(
         self, text: str, overrides: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, bytes, str]:
-        """调用火山新版接口合成一段音频。
+        """合成一段音频：按主页「语音引擎」分流到豆包 / MiMo。
 
         Args:
             text: 要合成的文本
-            overrides: 调用方按参数独立覆盖（key 可选 emotion/emotion_scale/speech_rate/loudness；
+            overrides: 调用方按参数独立覆盖（key 可选 emotion/emotion_scale；
+                       value=None 或缺省=用配置固定值）。供"麦麦自主"时 LLM 现场填。
+
+        Returns:
+            (ok, audio_bytes 或 b"", 错误信息或音色说明)
+        """
+        text = (text or "").strip()
+        if not text:
+            return False, b"", "文本为空"
+        if self._engine() == "mimo":
+            return await self._synthesize_mimo(text, overrides)
+        return await self._synthesize_doubao(text, overrides)
+
+    async def _synthesize_doubao(
+        self, text: str, overrides: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, bytes, str]:
+        """调用火山新版接口合成一段音频（引擎=doubao）。
+
+        Args:
+            text: 要合成的文本
+            overrides: 调用方按参数独立覆盖（key 可选 emotion/emotion_scale；
                        value=None 或缺省=用配置固定值）。供"麦麦自主"时 LLM 现场填。
 
         Returns:
             (ok, audio_bytes 或 b"", 错误信息或音色ID)
         """
-        api_key = self._api_key()
+        api_key = self._doubao_api_key()
         if not api_key:
             return False, b"", "API Key 未配置（插件配置 → 豆包语音 → api_key）"
-        text = (text or "").strip()
-        if not text:
-            return False, b"", "文本为空"
 
         ov = overrides if isinstance(overrides, dict) else {}
 
         resource_id = str(self._get("doubao", "resource_id", DOUBAO_RESOURCE_PRESET)).strip()
-        voice_type = _resolve_voice_type(str(self._get("voice_tone", "voice", DEFAULT_VOICE_DISPLAY)))
+        voice_type = _resolve_voice_type(str(self._get("doubao", "voice", DEFAULT_VOICE_DISPLAY)))
         audio_format = str(self._get("doubao", "audio_format", "mp3")).strip() or "mp3"
         sample_rate = int(self._get("doubao", "sample_rate", 24000) or 24000)
         timeout = float(self._get("behavior", "timeout_seconds", 30.0) or 30.0)
@@ -749,46 +962,21 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             "speaker": voice_type,
             "audio_params": {"format": audio_format, "sample_rate": sample_rate},
         }
-        # 情感：调用方覆盖优先，否则用配置固定值；"none"/空 = 不带情感
-        emotion_cfg = ""
-        if ov.get("emotion") is not None:
-            emotion_cfg = str(ov["emotion"] or "").strip()
-        if not emotion_cfg or emotion_cfg == "none":
-            emotion_cfg = str(self._get("voice_tone", "emotion", "") or "").strip()
-        if emotion_cfg and emotion_cfg != "none":
+        # 情感：LLM 覆盖优先，否则用主页「情感」固定值（"麦麦自主"/"无"=不带固定情感）
+        emotion_cfg = self._fixed_emotion(ov)
+        if emotion_cfg:
             emotion_val = PRESET_EMOTIONS.get(emotion_cfg, emotion_cfg)
             req_params["emotion"] = emotion_val
-            # 情感强度：调用方覆盖优先
-            scale = None
-            if ov.get("emotion_scale") is not None:
-                try:
-                    scale = float(ov["emotion_scale"])
-                except (TypeError, ValueError):
-                    scale = None
-            if scale is None:
-                scale = float(self._get("voice_tone", "emotion_scale", 1.0) or 1.0)
-            if 1.0 <= scale <= 5.0:
+            # 情感强度（豆包专用）：LLM 覆盖优先，否则主页「情感强度」固定档位
+            scale = self._fixed_emotion_scale(ov)
+            if scale is not None:
                 req_params["emotion_scale"] = scale
-        # 语速 → ratio（调用方覆盖优先）
-        rate = None
-        if ov.get("speech_rate") is not None:
-            try:
-                rate = float(ov["speech_rate"])
-            except (TypeError, ValueError):
-                rate = None
-        if rate is None:
-            rate = float(self._get("speed_loud", "speech_rate", 0.0) or 0.0)
+        # 语速 → ratio（豆包专用，仅手动配置）
+        rate = float(self._get("doubao", "speech_rate", 0.0) or 0.0)
         if rate:
             req_params["speed_ratio"] = round(1.0 + rate / 100.0, 4)
-        # 音量 → ratio（调用方覆盖优先）
-        vol = None
-        if ov.get("loudness") is not None:
-            try:
-                vol = float(ov["loudness"])
-            except (TypeError, ValueError):
-                vol = None
-        if vol is None:
-            vol = float(self._get("speed_loud", "loudness", 0.0) or 0.0)
+        # 音量 → ratio（豆包专用，仅手动配置）
+        vol = float(self._get("doubao", "loudness", 0.0) or 0.0)
         if vol:
             req_params["volume_ratio"] = round(1.0 + vol / 100.0, 4)
 
@@ -867,6 +1055,116 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             self.ctx.logger.error("[豆包TTS] 异常: %s", exc, exc_info=True)
             return False, b"", f"错误: {exc}"
 
+    async def _synthesize_mimo(
+        self, text: str, overrides: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, bytes, str]:
+        """调用小米 MiMo 音色复刻接口合成一段音频（引擎=mimo）。
+
+        接口为 OpenAI 兼容的 chat/completions：
+        - ``assistant`` 消息 = 要合成的文本（可带 (风格) 标签）；
+        - ``user`` 消息 = 可选的自然语言风格指令；
+        - ``audio.voice`` = 音源样本 DataURL（每次请求随样本复刻，无需预注册）。
+
+        Returns:
+            (ok, audio_bytes 或 b"", 错误信息或音源名)
+        """
+        api_key = self._mimo_api_key()
+        if not api_key:
+            return False, b"", "API Key 未配置（插件配置 → MiMo 语音 → api_key）"
+        voice_url, vinfo = self._mimo_voice_data_url()
+        if not voice_url:
+            return False, b"", f"复刻音源不可用: {vinfo}"
+
+        ov = overrides if isinstance(overrides, dict) else {}
+
+        # 情感 → (风格) 标签前缀：LLM 覆盖优先，否则用主页「情感」固定值
+        emotion = self._fixed_emotion(ov)
+        synth_text = text
+        if emotion:
+            tag = MIMO_EMOTION_TAGS.get(emotion, emotion)
+            synth_text = f"({tag}){text}"
+
+        style = str(self._get("mimo", "style", "") or "").strip()
+        timeout = float(self._get("behavior", "timeout_seconds", 30.0) or 30.0)
+
+        # 本地缓存：同样的文本+音源+风格直接复用上次的音频（键不含样本内容，含文件路径）
+        cache_params: Dict[str, Any] = {
+            "engine": "mimo",
+            "model": MIMO_MODEL,
+            "voice_sample": vinfo,
+            "style": style,
+            "emotion": emotion,
+            "text": text,
+        }
+        cache_dir = self._cache_dir()
+        cache_key = self._cache_key(cache_params) if cache_dir is not None else ""
+        if cache_dir is not None and cache_key:
+            cached = self._cache_lookup(cache_key, cache_dir)
+            if cached:
+                self.ctx.logger.info("[MiMoTTS] 命中本地缓存（%d 字节），跳过 API 调用", len(cached))
+                return True, cached, vinfo
+
+        messages: List[Dict[str, str]] = []
+        if style:
+            messages.append({"role": "user", "content": style})
+        messages.append({"role": "assistant", "content": synth_text})
+        payload = {
+            "model": MIMO_MODEL,
+            "messages": messages,
+            "audio": {"format": "wav", "voice": voice_url},
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        self.ctx.logger.info(
+            "[MiMoTTS] 合成请求: %d字 | 音源=%s | 情感=%s | 风格=%s",
+            len(text), vinfo, emotion or "-", style[:30] or "-",
+        )
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    MIMO_TTS_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text(errors="replace")).strip()[:300]
+                        self.ctx.logger.error("[MiMoTTS] HTTP %s: %s", resp.status, body)
+                        return False, b"", f"MiMo 接口 HTTP {resp.status}: {body}"
+
+                    data = await resp.json(content_type=None)
+                    err = data.get("error") if isinstance(data, dict) else None
+                    if err:
+                        msg = err.get("message") if isinstance(err, dict) else str(err)
+                        self.ctx.logger.error("[MiMoTTS] 业务错误: %s", msg)
+                        return False, b"", f"MiMo 业务错误: {msg}"
+                    audio_b64 = ""
+                    try:
+                        audio_b64 = str(data["choices"][0]["message"]["audio"]["data"] or "")
+                    except (KeyError, TypeError, IndexError, AttributeError):
+                        pass
+                    if not audio_b64:
+                        return False, b"", "MiMo 未返回音频数据（检查 API Key 与音源文件）"
+                    audio = base64.b64decode(audio_b64)
+                    if not audio:
+                        return False, b"", "MiMo 返回空音频"
+                    self.ctx.logger.info("[MiMoTTS] 合成成功 %d 字节", len(audio))
+                    if cache_dir is not None and cache_key:
+                        self._cache_store(cache_key, audio, cache_dir)
+                    return True, audio, vinfo
+        except asyncio.TimeoutError:
+            self.ctx.logger.error("[MiMoTTS] 请求超时（%ss）", timeout)
+            return False, b"", f"请求超时（{timeout:.0f}s）"
+        except aiohttp.ClientError as exc:
+            self.ctx.logger.error("[MiMoTTS] 网络错误: %s", exc)
+            return False, b"", f"网络错误: {type(exc).__name__}"
+        except Exception as exc:  # noqa: BLE001 兜底
+            self.ctx.logger.error("[MiMoTTS] 异常: %s", exc, exc_info=True)
+            return False, b"", f"错误: {exc}"
+
     async def _send_voice(self, audio: bytes, stream_id: str, text: str = "") -> bool:
         """把音频 base64 后经 send.custom("voice") 发到会话，并把原文写回对话上下文。
 
@@ -887,7 +1185,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             self.ctx.logger.error("[豆包TTS] 发送语音失败: %s", exc)
             return False
 
-        if ok and text and self._get("behavior", "sync_chat_context", True):
+        if ok and text and self._get("plugin", "sync_chat_context", True):
             await self._append_chat_context(stream_id, text)
         return ok
 
@@ -950,8 +1248,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             await self._maybe_error(stream_id, f"文本太长（{len(text)}字），请精简到 500 字以内")
             return False, "文本过长"
 
-        if not self._api_key():
-            msg = "豆包语音 API Key 未配置，请先在插件配置里填写"
+        if not self._active_api_key():
+            msg = f"{self._engine_name()}语音 API Key 未配置，请先在插件配置里填写"
             await self._maybe_error(stream_id, msg)
             return False, "API Key 未配置"
 
@@ -971,11 +1269,11 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return True, note
         # 失败处理
         self.ctx.logger.warning("[豆包TTS] 语音合成失败(%s): %s", source, note)
-        if self._get("behavior", "fallback_to_text", True):
+        if self._get("plugin", "fallback_to_text", True):
             try:
                 if await self.ctx.send.text(text, stream_id):
                     # 降级成文字时同样要知道自己说过什么，行为才一致
-                    if self._get("behavior", "sync_chat_context", True):
+                    if self._get("plugin", "sync_chat_context", True):
                         await self._append_chat_context(stream_id, text)
                     return True, "语音合成失败，已改为文字回复"
             except Exception:
@@ -995,7 +1293,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         Returns:
             bool: 是否真的发出了提示。
         """
-        if not self._get("behavior", "send_error_prompt", True):
+        if not self._get("plugin", "send_error_prompt", True):
             return False
         if self._recently_prompted(stream_id):
             return False
@@ -1012,11 +1310,12 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         "doubao_tts_say",
         description="用豆包语音把指定文本说出来",
         pattern=r"^/(说|语音|speak)\s+(?P<text>.+)\s*$",
+        permission="operator",
     )
     async def _cmd_say(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Tuple[bool, str, int]:
         """/说 文本 / 语音 文本 / speak 文本"""
         del kwargs
-        if not self._get("behavior", "command_enabled", True):
+        if not self._get("plugin", "command_enabled", True):
             return False, "手动命令已禁用", 1
         if not stream_id:
             return False, "缺少 stream_id", 1
@@ -1032,23 +1331,35 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         "doubao_tts_help",
         description="查看豆包语音帮助",
         pattern=r"^/(语音帮助|说帮助|tts帮助)\s*$",
+        permission="operator",
     )
     async def _cmd_help(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
         """/语音帮助"""
         del kwargs
         if not stream_id:
             return False, "缺少 stream_id", 1
-        voice_list = "、".join(PRESET_VOICES.keys())
         emotion_list = "、".join(PRESET_EMOTIONS.keys())
-        text = (
-            "【豆包语音】\n"
-            f"- 用法：/说 文本 或 /语音 文本\n"
-            f"- API Key：{'已配置' if self._api_key() else '未配置'}\n"
-            f"- 当前音色：{self._get('voice_tone', 'voice', DEFAULT_VOICE_DISPLAY)}\n"
-            f"- 预置音色：{voice_list}\n"
-            f"- 情感（可选）：{emotion_list}\n"
-            "- 换音色/情感：WebUI 插件配置里修改即可"
-        )
+        if self._engine() == "mimo":
+            _, vinfo = self._mimo_voice_data_url()
+            text = (
+                "【MiMo 语音（音色复刻）】\n"
+                "- 用法：/说 文本 或 /语音 文本\n"
+                f"- API Key：{'已配置' if self._mimo_api_key() else '未配置'}\n"
+                f"- 复刻音源：{vinfo}\n"
+                f"- 情感（可选）：{emotion_list}\n"
+                "- 换音源/风格：WebUI 插件配置「MiMo 语音」页修改"
+            )
+        else:
+            voice_list = "、".join(PRESET_VOICES.keys())
+            text = (
+                "【豆包语音】\n"
+                "- 用法：/说 文本 或 /语音 文本\n"
+                f"- API Key：{'已配置' if self._doubao_api_key() else '未配置'}\n"
+                f"- 当前音色：{self._get('doubao', 'voice', DEFAULT_VOICE_DISPLAY)}\n"
+                f"- 预置音色：{voice_list}\n"
+                f"- 情感（可选）：{emotion_list}\n"
+                "- 换音色/情感：WebUI 插件配置里修改即可"
+            )
         await self.ctx.send.text(text, stream_id)
         return True, "已发送帮助", 1
 
@@ -1056,13 +1367,12 @@ class DoubaoTTSPlugin(MaiBotPlugin):
 
     @Tool(
         "doubao_tts_speak",
-        brief_description="用语音（豆包TTS）说话",
+        brief_description="用语音说话（豆包/MiMo TTS）",
         detailed_description=(
             "当用户明确要求“用语音/说话/朗读/语音回复”时使用。"
             "文本宜为一句完整的话（5~80字）。若内容很长（>150字），只取其中最想强调的一句话来朗读，其余仍用文字。"
-            "可选按对话氛围调节语气：emotion（情感，如安慰时平静、玩闹时开心）、emotion_scale（强度1~5，配合 emotion）。"
+            "可选按对话氛围调节语气：emotion（情感，如安慰时平静、玩闹时开心）、emotion_scale（强度1~5，仅豆包生效）。"
             "每个参数可单独给，未给的使用插件配置里的固定值；拿不准就都省略，用默认语气即可。"
-            "（语速、音量为固定设置，不由本工具调节。）"
         ),
         parameters=[
             ToolParameterInfo(
@@ -1100,17 +1410,16 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return {"success": False, "message": "缺少 stream_id，无法发送语音"}
         if not (text or "").strip():
             return {"success": False, "message": "text 为空，未发送"}
-        # 麦麦自主语音由 auto_voice_mode 管控（off=麦麦不自主）；
-        # command_enabled 只管 /说 手动命令，不该挡这里（修 v1.4.4：原版把它错用在 Tool 上，
+        # 麦麦自主语音由主页「自主语音方式」管控（off=麦麦不自主）；
+        # 「手动命令」开关只管 /说 手动命令，不该挡这里（修 v1.4.4：原版把它错用在 Tool 上，
         # 关掉手动命令会让麦麦每次调用本工具都失败）。
         if self._auto_voice_mode() == "off":
-            return {"success": False, "message": "麦麦自主语音已关闭（behavior.auto_voice_mode=off），请使用 /说 手动命令"}
-        # 语速/音量为连续数值，仅支持手动固定（不在此工具参数中提供）
-        # 按各参数的"来源模式"组装 overrides：auto=接受 LLM 传入；fixed=忽略、用配置固定值
+            return {"success": False, "message": "麦麦自主语音已关闭（自主语音方式=off），请使用 /说 手动命令"}
+        # LLM 传入的情感/强度直接透传；主页选了固定值且 LLM 未给时，合成层自动改用固定值
         overrides: Dict[str, Any] = {}
-        if self._get("behavior", "emotion_mode", "fixed") == "auto" and (emotion or "").strip():
+        if (emotion or "").strip():
             overrides["emotion"] = (emotion or "").strip()
-        if self._get("behavior", "emotion_scale_mode", "fixed") == "auto" and emotion_scale is not None:
+        if emotion_scale is not None:
             overrides["emotion_scale"] = emotion_scale
         ok, note = await self._handle_speech(text, stream_id, "Tool", overrides=overrides or None)
         if ok:
