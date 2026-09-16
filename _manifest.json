@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
-  "version": "1.4.0",
+  "version": "1.7.1",
   "id": "github.ZhaoCang-QWQ.doubao-tts",
   "name": "豆包语音TTS（新版控制台）",
-  "description": "麦麦语音回复：调用火山引擎豆包语音合成大模型把文字变语音。内置官方预置音色库，也支持复刻音色；若 /说 后收到的是文字而非语音，通常是音色与资源不匹配（复刻音色须配 seed-icl-2.0，预置音色配 seed-tts-2.0）。新版 X-Api-Key 鉴权，无需旧版 App ID。",
+  "description": "麦麦语音回复：调用火山引擎豆包语音合成大模型把文字变语音。内置官方预置音色库，也支持复刻音色。支持跨语种合成（麦麦说日语/英语等外语时自动按该语种合成，复刻音色也能说外语）；并可选启用「语音翻译」——麦麦默认用中文回复、而你的音色是外语训练时，可让它把回复翻译成目标语言再说出来。翻译方式四选一：不翻译（原样）/ 全部翻译（全说外语）/ 按概率翻译（中外交替）/ 由麦麦判断（LLM 按你的规则决定）。目标语种支持日语、英语、韩语、西班牙语、印尼语、葡萄牙语等（以音色实际支持范围为准），默认关闭、零打扰。若 /说 后收到的是文字而非语音，通常是音色与资源不匹配（复刻音色须配 seed-icl-2.0，预置音色配 seed-tts-2.0）。新版 X-Api-Key 鉴权，无需旧版 App ID。",
   "author": {
     "name": "昭沧QWQ",
     "url": "https://github.com/ZhaoCang-QWQ"
@@ -30,7 +30,9 @@
   ],
   "capabilities": [
     "send.text",
-    "send.custom"
+    "send.custom",
+    "llm.generate",
+    "llm.get_available_models"
   ],
   "plugin_type": "extension",
   "display": {

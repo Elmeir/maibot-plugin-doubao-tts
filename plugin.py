@@ -3,11 +3,12 @@
 让麦麦能用豆包语音（火山引擎 · 语音合成大模型）说话。
 
 - 手动触发：发送 ``/说 文本`` / ``/语音 文本`` / ``/speak 文本``，麦麦把文本转语音发到当前会话；
-- 麦麦自主触发：插件注册一个 Tool「speak_text」，LLM 在合适时机（用户要求用语音时）调用它；
+- 麦麦自主触发：插件注册一个 Tool ``doubao_tts_speak``，LLM 在合适时机（用户要求用语音时）调用它；
 - 音色：内置火山官方预置音色清单（按名字选即可），也支持直接填 voice_type 音色 ID 或复刻音色 ID；
+- 跨语种：麦麦回复是日语/英语等外语时，自动按该语种合成；也可开启「语音翻译」把中文回复翻成目标语种；
 - 鉴权：火山引擎**新版控制台** API Key（X-Api-Key 单头鉴权），无需旧版 App ID / Access Token。
 
-独立实现；功能组织参考了 xuqian13/tts_voice_plugin，代码不共用（致谢见 README）。
+功能组织参考了 xuqian13/tts_voice_plugin（致谢见 README）。
 """
 
 import asyncio
@@ -27,7 +28,7 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, To
 
 logger = logging.getLogger("plugin.doubao_tts")
 
-SUPPORTED_CONFIG_VERSION = "1.4.0"
+SUPPORTED_CONFIG_VERSION = "1.7.1"
 # ─── 火山引擎 API ────────────────────────────────────────────────────────────
 DOUBAO_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 DOUBAO_RESOURCE_PRESET = "seed-tts-2.0"   # 预置音色（语音合成模型 2.0）
@@ -77,6 +78,108 @@ def _resolve_voice_type(voice: str) -> str:
     if voice in PRESET_VOICES:
         return PRESET_VOICES[voice]
     return voice  # 直接当作 voice_type ID（预置 ID / 复刻音色 ID）
+
+
+def detect_language(text: str) -> str:
+    """按字符范围粗略判断文本语种，返回火山 ``explicit_language`` 取值。
+
+    返回 ``""`` 表示"不指定"（交给火山默认处理）。
+
+    为什么需要这个（2026-09-16 实测结论，音色 S_RcCsDWbd2 + seed-icl-2.0）：
+      · 日语文本 **不传** explicit_language → 发音明显退化，不可接受；
+      · 日语文本 **传** ``ja`` → 发音正常；
+      · 中文文本（不传）、英文文本（不传）→ 都正常，无需指定。
+    所以这里只对"非中英、且能从字符判断出来"的语种做显式指定，中英文保持默认。
+    """
+    if not text:
+        return ""
+
+    def has(lo: str, hi: str) -> bool:
+        return any(lo <= ch <= hi for ch in text)
+
+    if has("\u3040", "\u30ff"):        # 平假名 / 片假名
+        return "ja"
+    if has("\uac00", "\ud7af"):        # 谚文（韩语）
+        return "ko"
+    if has("\u0400", "\u04ff"):        # 西里尔字母（俄语等）
+        return "ru"
+    if has("\u0600", "\u06ff"):        # 阿拉伯字母
+        return "ar"
+    if has("\u0e00", "\u0e7f"):        # 泰文
+        return "th"
+    # 其余（中文 / 英文 / 拉丁字母其他语言）不指定，走火山默认，实测正常
+    return ""
+
+
+# 语种别名（中文名 / 代码）→ (中文名, 火山 explicit_language 取值)
+LANG_ALIASES: Dict[str, Tuple[str, str]] = {
+    "ja": ("日语", "ja"), "jp": ("日语", "ja"), "日语": ("日语", "ja"), "日文": ("日语", "ja"),
+    "en": ("英语", "en"), "英语": ("英语", "en"), "英文": ("英语", "en"),
+    "ko": ("韩语", "ko"), "kr": ("韩语", "ko"), "韩语": ("韩语", "ko"), "韩文": ("韩语", "ko"),
+    "zh-cn": ("中文", "zh-cn"), "zh": ("中文", "zh-cn"), "cn": ("中文", "zh-cn"),
+    "中文": ("中文", "zh-cn"), "汉语": ("中文", "zh-cn"),
+    "de": ("德语", "de"), "德语": ("德语", "de"),
+    "fr": ("法语", "fr"), "法语": ("法语", "fr"),
+    "es-mx": ("西班牙语", "es-mx"), "es": ("西班牙语", "es-mx"), "西班牙语": ("西班牙语", "es-mx"),
+    "id": ("印尼语", "id"), "印尼语": ("印尼语", "id"),
+    "pt-br": ("葡萄牙语", "pt-br"), "pt": ("葡萄牙语", "pt-br"), "葡萄牙语": ("葡萄牙语", "pt-br"),
+    "ru": ("俄语", "ru"), "俄语": ("俄语", "ru"),
+    "th": ("泰语", "th"), "泰语": ("泰语", "th"),
+    "ar": ("阿拉伯语", "ar"), "阿拉伯语": ("阿拉伯语", "ar"),
+}
+
+
+def resolve_language(name: str) -> Tuple[str, str]:
+    """把用户填写的语种（中文名或代码）解析为 (中文名, 代码)；无法识别时返回 ("", "")。"""
+    raw = (name or "").strip()
+    if not raw:
+        return "", ""
+    hit = LANG_ALIASES.get(raw) or LANG_ALIASES.get(raw.lower())
+    if hit:
+        return hit
+    return raw, ""   # 未知写法：中文名按原样用于翻译提示，代码留空
+
+
+def _looks_like_language(text: str, code: str) -> bool:
+    """粗略判断文本是否**整句**已经是目标语种（用于跳过无意义的翻译）。
+
+    ⚠️ 不能只看"有没有该语种字符"：麦麦的中文回复经常夹带日语语气词/角色口癖，
+    若一见到假名就判定"这已经是日语"，整句中文就不会被翻译——实测踩过这个坑。
+    因此这里改为比例判断：只有目标语种字符在句中占主导，才算"已是该语种"。
+    """
+    if not text:
+        return False
+
+    def count(lo: str, hi: str) -> int:
+        return sum(1 for ch in text if lo <= ch <= hi)
+
+    han = count("\u4e00", "\u9fff")   # 汉字（中文/日文共用，单凭它无法区分）
+
+    if code == "ja":
+        kana = count("\u3040", "\u30ff")
+        if kana == 0:
+            return False
+        # 假名数量不少于汉字的一半，才认为整句是日语（正常日语文本通常远高于此）
+        return kana * 2 >= han
+
+    if code in ("ko", "ru", "ar", "th"):
+        span = {
+            "ko": ("\uac00", "\ud7af"),
+            "ru": ("\u0400", "\u04ff"),
+            "ar": ("\u0600", "\u06ff"),
+            "th": ("\u0e00", "\u0e7f"),
+        }[code]
+        lang_chars = count(*span)
+        if lang_chars == 0:
+            return False
+        # 目标语种字符比汉字还少 → 属于中（外）混排，仍需翻译
+        return lang_chars > han
+
+    if code == "zh-cn":
+        return han > 0 and detect_language(text) == ""
+
+    # 拉丁字母语系（英/德/法/西/葡/印尼）在字符层面无法区分，统一交给模型翻译
+    return False
 
 
 def _split_sentences(text: str, max_len: int) -> List[str]:
@@ -177,8 +280,14 @@ class VoiceToneSectionConfig(PluginConfigBase):
     @field_validator("emotion", mode="before")
     @classmethod
     def _normalize_emotion(cls, v: Any) -> Any:
-        """兼容旧配置：把空字符串归一化为 'none'（下拉不允许空串选项，历史保存值可能为 ""）。"""
-        if v is None or (isinstance(v, str) and v.strip() == ""):
+        """兼容历史配置里的"无情感"写法，避免 Literal 校验失败导致插件启动不了。
+
+        下拉不允许空串选项（前端会崩），所以"无"在不同版本里用过不同占位值：
+        `""` / `none` / `无` / `无（正常语气）`。这里统一归一化为 `none`。
+        """
+        if v is None:
+            return "none"
+        if isinstance(v, str) and v.strip() in ("", "none", "无", "无（正常语气）", "无(正常语气)"):
             return "none"
         return v
 
@@ -240,12 +349,96 @@ class SpeedLoudSectionConfig(PluginConfigBase):
     )
 
 
+class TranslateSectionConfig(PluginConfigBase):
+    """语音翻译配置：合成前把文本翻译成目标语言。"""
+
+    __ui_label__ = "语音翻译"
+    __ui_icon__ = "languages"
+    __ui_order__ = 4
+
+    mode: Literal["不翻译", "全部翻译", "按概率翻译", "由麦麦判断"] = Field(
+        default="不翻译",
+        description=(
+            "合成前要不要先把文本翻译成「目标语种」，四选一：\n"
+            "· 不翻译（默认）：原样合成，麦麦说什么语言就合成什么语言（中英日混排也原样保留）；\n"
+            "· 全部翻译：所有回复都翻译成目标语种（例如全说日语）；\n"
+            "· 按概率翻译：每条回复掷骰子，按「翻译概率」决定这条翻不翻 → 会出现中/外语交替；\n"
+            "· 由麦麦判断：让 LLM 读这条回复自己决定翻不翻（判断依据可写在「判断规则」里）。"
+        ),
+        json_schema_extra={
+            "label": "翻译方式",
+            "hint": (
+                "· 不翻译 = 麦麦说中文就发中文语音\n"
+                "· 全部翻译 = 全说目标语种（适合麦麦说中文、音色是外语音色的情况）\n"
+                "· 按概率翻译 = 由「翻译概率」控制，例如 0.5 → 约一半回复是外语、一半保留中文\n"
+                "· 由麦麦判断 = 让麦麦自己决定（会多一次模型调用，可在「判断规则」里告诉它你的偏好）\n"
+                "四种模式都会自动跳过「文本已是目标语种」的情况；翻译失败一律回退原文，不影响发声。"
+            ),
+        },
+    )
+    target: str = Field(
+        default="",
+        description=(
+            "要翻译成哪种语言——填你的音色所训练的语言。"
+            "支持中文名或代码：日语/ja、英语/en、韩语/ko、德语/de、法语/fr、"
+            "西班牙语/es-mx、印尼语/id、葡萄牙语/pt-br、俄语/ru、泰语/th、阿拉伯语/ar。留空=不翻译"
+        ),
+        json_schema_extra={
+            "label": "目标语种",
+            "placeholder": "日语（或 ja）",
+            "hint": (
+                "填「音色训练时用的语言」：日语=ja｜英语=en｜韩语=ko｜德语=de｜法语=fr｜"
+                "西班牙语=es-mx｜印尼语=id｜葡萄牙语=pt-br｜俄语=ru｜泰语=th｜阿拉伯语=ar\n"
+                "中文名或代码都行（填「日语」与「ja」等效）。留空 = 不翻译。"
+            ),
+        },
+    )
+    probability: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="「按概率翻译」模式下的翻译概率 0~1：0.5=约一半回复翻译、一半保留原文；1=全都翻译、0=都不翻译。其他模式忽略此项",
+        json_schema_extra={
+            "label": "翻译概率",
+            "hint": "仅「按概率翻译」模式生效。0.3 = 约三成回复翻成外语，七成保留原文。想「偶尔冒一句日语」就调小一点。",
+        },
+    )
+    rule: str = Field(
+        default="",
+        description=(
+            "「由麦麦判断」模式下的判断依据（可选）。留空则用默认规则："
+            "日常口语化的内容翻译，纯信息类（数字、链接、代码、专有名词、报错）保留原文"
+        ),
+        json_schema_extra={
+            "label": "判断规则（可选）",
+            "placeholder": "例如：只有安慰我、闲聊时用日语；其他都保留中文",
+            "hint": "用一句话告诉麦麦「什么时候该说外语」。留空 = 默认规则（口语内容翻译，数字/链接/专有名词保留）。",
+        },
+    )
+    model_task: str = Field(
+        default="utils",
+        description="用哪个麦麦模型来做翻译（填模型任务名，如 utils / replyer / planner；utils 是小模型、便宜快，推荐）",
+        json_schema_extra={
+            "label": "翻译用模型任务",
+            "placeholder": "utils",
+            "hint": "填的是「模型任务名」而不是模型名。utils=麦麦的小模型（便宜快，推荐）；也可填 replyer / planner。留空时自动用 utils。",
+        },
+    )
+    max_tokens: int = Field(
+        default=800,
+        ge=50,
+        le=4000,
+        description="译文最大长度（token）。语音单条上限 500 字，译成外语通常变长，插件还会按原文长度自动放大，一般不用改",
+        json_schema_extra={"label": "译文最大 tokens"},
+    )
+
+
 class BehaviorSectionConfig(PluginConfigBase):
     """行为配置。"""
 
     __ui_label__ = "行为"
     __ui_icon__ = "sliders"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     command_enabled: bool = Field(
         default=True,
@@ -320,6 +513,7 @@ class DoubaoTTSRootConfig(PluginConfigBase):
     doubao: DoubaoSectionConfig = Field(default_factory=DoubaoSectionConfig, json_schema_extra={"label": "豆包语音"})
     voice_tone: VoiceToneSectionConfig = Field(default_factory=VoiceToneSectionConfig, json_schema_extra={"label": "音色与情感"})
     speed_loud: SpeedLoudSectionConfig = Field(default_factory=SpeedLoudSectionConfig, json_schema_extra={"label": "语速与音量"})
+    translate: TranslateSectionConfig = Field(default_factory=TranslateSectionConfig, json_schema_extra={"label": "语音翻译"})
     behavior: BehaviorSectionConfig = Field(default_factory=BehaviorSectionConfig, json_schema_extra={"label": "行为"})
 
 
@@ -478,6 +672,30 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             self.ctx.logger.warning(
                 "[豆包TTS] 尚未配置 API Key：请在插件配置 [doubao] api_key 填写火山引擎新版控制台的 API Key"
             )
+        # 语音翻译状态 + 可用模型任务（方便用户填对「翻译用模型任务」）
+        mode = self._translate_mode()
+        if mode != "不翻译":
+            tgt = str(self._get("translate", "target", "") or "").strip()
+            name, _code = resolve_language(tgt)
+            if name:
+                self.ctx.logger.info(
+                    "[豆包TTS] 语音翻译：方式=%s | 目标语种=%s | 模型任务=%s",
+                    mode, name, self._get("translate", "model_task", "utils"),
+                )
+                if mode == "按概率翻译":
+                    self.ctx.logger.info(
+                        "[豆包TTS] 翻译概率 = %s", self._get("translate", "probability", 0.5)
+                    )
+            else:
+                self.ctx.logger.warning(
+                    "[豆包TTS] 翻译方式=%s，但「目标语种」为空或无法识别（%r），实际不会翻译", mode, tgt
+                )
+            try:
+                models = await self.ctx.llm.get_available_models()
+                if models:
+                    self.ctx.logger.info("[豆包TTS] 可选模型任务: %s", "、".join(str(m) for m in models))
+            except Exception:
+                pass
 
     async def on_unload(self) -> None:
         self.ctx.logger.info("[豆包TTS] 插件已卸载")
@@ -515,11 +733,15 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         sample_rate = int(self._get("doubao", "sample_rate", 24000) or 24000)
         timeout = float(self._get("behavior", "timeout_seconds", 30.0) or 30.0)
 
+        audio_params: Dict[str, Any] = {"format": audio_format, "sample_rate": sample_rate}
         req_params: Dict[str, Any] = {
             "text": text,
             "speaker": voice_type,
-            "audio_params": {"format": audio_format, "sample_rate": sample_rate},
+            "audio_params": audio_params,
         }
+        # ⚠️ v1.4.1 修复：官方接口要求 emotion / emotion_scale / speech_rate / loudness_rate
+        #    全部放在 req_params.audio_params 内。v1.4.0 误放在 req_params 顶层、且语速/音量用了
+        #    旧接口的字段名（speed_ratio / volume_ratio）与倍率值，会被服务端静默忽略 → 设置无效。
         # 情感：调用方覆盖优先，否则用配置固定值；"none"/空 = 不带情感
         emotion_cfg = ""
         if ov.get("emotion") is not None:
@@ -527,9 +749,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if not emotion_cfg or emotion_cfg == "none":
             emotion_cfg = str(self._get("voice_tone", "emotion", "") or "").strip()
         if emotion_cfg and emotion_cfg != "none":
-            emotion_val = PRESET_EMOTIONS.get(emotion_cfg, emotion_cfg)
-            req_params["emotion"] = emotion_val
-            # 情感强度：调用方覆盖优先
+            audio_params["emotion"] = PRESET_EMOTIONS.get(emotion_cfg, emotion_cfg)
+            # 情感强度：调用方覆盖优先（1~5）
             scale = None
             if ov.get("emotion_scale") is not None:
                 try:
@@ -539,8 +760,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             if scale is None:
                 scale = float(self._get("voice_tone", "emotion_scale", 1.0) or 1.0)
             if 1.0 <= scale <= 5.0:
-                req_params["emotion_scale"] = scale
-        # 语速 → ratio（调用方覆盖优先）
+                audio_params["emotion_scale"] = scale
+        # 语速：-50~100 的整数（0=正常，100=2.0 倍速）——官方字段名 speech_rate
         rate = None
         if ov.get("speech_rate") is not None:
             try:
@@ -550,8 +771,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if rate is None:
             rate = float(self._get("speed_loud", "speech_rate", 0.0) or 0.0)
         if rate:
-            req_params["speed_ratio"] = round(1.0 + rate / 100.0, 4)
-        # 音量 → ratio（调用方覆盖优先）
+            audio_params["speech_rate"] = int(max(-50, min(100, round(rate))))
+        # 音量：-50~100 的整数（0=正常，100=2.0 倍）——官方字段名 loudness_rate
         vol = None
         if ov.get("loudness") is not None:
             try:
@@ -561,7 +782,15 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if vol is None:
             vol = float(self._get("speed_loud", "loudness", 0.0) or 0.0)
         if vol:
-            req_params["volume_ratio"] = round(1.0 + vol / 100.0, 4)
+            audio_params["loudness_rate"] = int(max(-50, min(100, round(vol))))
+        # additions（官方要求是 JSON 字符串）：
+        #  · disable_markdown_filter：过滤麦麦回复里的 **加粗**、# 标题等，否则会被逐字念出来；
+        #  · explicit_language：文本是日语等非中英语种时必须显式指定，否则发音明显退化（实测结论）。
+        additions: Dict[str, Any] = {"disable_markdown_filter": True}
+        detected_lang = detect_language(text)
+        if detected_lang:
+            additions["explicit_language"] = detected_lang
+        req_params["additions"] = json.dumps(additions, ensure_ascii=False)
 
         headers = {
             "Content-Type": "application/json",
@@ -569,8 +798,32 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             "X-Api-Resource-Id": resource_id,
             "X-Api-Request-Id": str(uuid.uuid4()),
         }
+        # v1.4.1 新增：音色与 Resource ID 不匹配时提前告警（这是最常见的失败原因，
+        # 否则用户只能看到一句 resource ID is mismatched，不知道该怎么改）
+        is_clone_voice = voice_type.upper().startswith("S_")
+        if is_clone_voice and resource_id == DOUBAO_RESOURCE_PRESET:
+            self.ctx.logger.warning(
+                "[豆包TTS] 音色 %s 是复刻音色，但 Resource ID 是 %s —— 会报 "
+                "'resource ID is mismatched with speaker related resource'。"
+                "请把「豆包语音」页的 Resource ID 改成 %s",
+                voice_type, resource_id, DOUBAO_RESOURCE_CLONE,
+            )
+        elif (not is_clone_voice) and resource_id == DOUBAO_RESOURCE_CLONE:
+            self.ctx.logger.warning(
+                "[豆包TTS] 音色 %s 是预置音色，但 Resource ID 是 %s（复刻用）—— 可能报资源不匹配，"
+                "请把 Resource ID 改成 %s",
+                voice_type, resource_id, DOUBAO_RESOURCE_PRESET,
+            )
+
         payload = {"req_params": req_params}
-        self.ctx.logger.info("[豆包TTS] 合成请求: %d字 | %s | %s | 情感=%s", len(text), resource_id, voice_type, req_params.get("emotion", "-"))
+        self.ctx.logger.info(
+            "[豆包TTS] 合成请求: %d字 | %s | %s | 情感=%s | 语速=%s | 音量=%s | 语种=%s",
+            len(text), resource_id, voice_type,
+            audio_params.get("emotion", "-"),
+            audio_params.get("speech_rate", 0),
+            audio_params.get("loudness_rate", 0),
+            detected_lang or "默认（不指定）",
+        )
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -658,6 +911,102 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return True, f"部分成功 {ok}/{total}"
         return False, "合成失败"
 
+    def _translate_mode(self) -> str:
+        """当前翻译方式：不翻译 / 全部翻译 / 按概率翻译 / 由麦麦判断。"""
+        mode = str(self._get("translate", "mode", "不翻译") or "不翻译").strip()
+        if mode not in ("不翻译", "全部翻译", "按概率翻译", "由麦麦判断"):
+            return "不翻译"
+        return mode
+
+    async def _call_llm(self, prompt: str, max_tokens: int) -> str:
+        """调用麦麦的模型；失败/为空时返回 ""。"""
+        task = str(self._get("translate", "model_task", "utils") or "utils").strip()
+        try:
+            resp = await self.ctx.llm.generate(
+                prompt=prompt, model=task, temperature=0.2, max_tokens=max_tokens
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("[豆包TTS] 模型调用失败: %s", exc)
+            return ""
+        if isinstance(resp, dict) and resp.get("success") is False:
+            self.ctx.logger.warning("[豆包TTS] 模型调用失败: %s", resp.get("error") or resp)
+            return ""
+        if isinstance(resp, dict):
+            return str(resp.get("response") or resp.get("content") or "").strip()
+        return ""
+
+    async def _translate_if_needed(self, text: str) -> str:
+        """按「翻译方式」决定是否把文本翻译成目标语种。
+
+        任何异常/失败/未配置 → 一律返回原文（绝不阻塞语音）。
+        """
+        mode = self._translate_mode()
+        if mode == "不翻译":
+            return text
+        target_raw = str(self._get("translate", "target", "") or "").strip()
+        lang_name, lang_code = resolve_language(target_raw)
+        if not lang_name:
+            self.ctx.logger.warning(
+                "[豆包TTS] 翻译方式=%s，但「目标语种」为空或无法识别（%r），本次不翻译", mode, target_raw
+            )
+            return text
+        if _looks_like_language(text, lang_code):
+            self.ctx.logger.info("[豆包TTS] 文本已是%s，跳过翻译", lang_name)
+            return text
+
+        # 按概率翻译：没命中就原样发出（中文/外语交替出现）
+        if mode == "按概率翻译":
+            try:
+                prob = float(self._get("translate", "probability", 0.5))
+            except (TypeError, ValueError):
+                prob = 0.5
+            prob = max(0.0, min(1.0, prob))
+            hit = random.random() < prob
+            self.ctx.logger.info(
+                "[豆包TTS] 按概率翻译：概率 %.2f，本次%s", prob, "命中→翻译" if hit else "未命中→保留原文"
+            )
+            if not hit:
+                return text
+
+        # 译文长度自适应：原文最长 500 字，译成外语通常膨胀 2~2.5 倍
+        cfg_tokens = int(self._get("translate", "max_tokens", 800) or 800)
+        max_tokens = max(cfg_tokens, min(4000, int(len(text) * 2.5) + 60))
+
+        if mode == "由麦麦判断":
+            # 一次调用同时完成「判断 + 翻译」：不需要翻译时让它只输出 KEEP
+            rule = str(self._get("translate", "rule", "") or "").strip() or (
+                "日常口语化的内容适合翻译；纯信息类内容（数字、链接、代码、专有名词、报错提示）保留原文"
+            )
+            prompt = (
+                f"你要决定下面这句话是否需要翻译成{lang_name}。\n"
+                f"判断依据：{rule}\n"
+                f"· 需要翻译 → 只输出{lang_name}译文本身（不要解释、不要引号、不要 Markdown 符号）\n"
+                "· 不需要翻译 → 只输出 KEEP 这四个字母\n\n"
+                f"待判断的句子：{text}"
+            )
+            out = await self._call_llm(prompt, max_tokens)
+            if not out:
+                self.ctx.logger.warning("[豆包TTS] 麦麦判断失败（改用原文合成）")
+                return text
+            if "KEEP" in out[:12].upper():
+                self.ctx.logger.info("[豆包TTS] 麦麦判断：本条保留原文")
+                return text
+            self.ctx.logger.info("[豆包TTS] 麦麦判断：翻译为%s → %s", lang_name, out[:60])
+            return out
+
+        # 全部翻译（或按概率已命中）
+        prompt = (
+            f"你是专业翻译引擎。请把下面的文本翻译成{lang_name}，"
+            "只输出译文本身：不要解释、不要加引号、不要保留 Markdown 符号或表情符号。\n\n"
+            f"{text}"
+        )
+        out = await self._call_llm(prompt, max_tokens)
+        if not out:
+            self.ctx.logger.warning("[豆包TTS] 翻译失败（改用原文合成）")
+            return text
+        self.ctx.logger.info("[豆包TTS] 已翻译为%s：%s", lang_name, out[:60])
+        return out
+
     async def _handle_speech(
         self, text: str, stream_id: str, source: str, overrides: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, str]:
@@ -683,7 +1032,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             "[豆包TTS] %s 触发语音: %d字 覆盖=%s", source, len(text), json.dumps({k: v for k, v in ov.items() if v is not None}, ensure_ascii=False) or "-"
         )
-        ok, note = await self._speech(text, stream_id, overrides=ov)
+        # 语音翻译（可选）：开启后先把文本翻成目标语种，再用音色说出来
+        tts_text = await self._translate_if_needed(text)
+        ok, note = await self._speech(tts_text, stream_id, overrides=ov)
         if ok:
             return True, note
         # 失败处理
@@ -738,14 +1089,24 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return False, "缺少 stream_id", True
         voice_list = "、".join(PRESET_VOICES.keys())
         emotion_list = "、".join(PRESET_EMOTIONS.keys())
+        mode = self._translate_mode()
+        if mode == "不翻译":
+            translate_line = "不翻译（原样合成）"
+        else:
+            tgt_name, _tgt_code = resolve_language(
+                str(self._get("translate", "target", "") or "")
+            )
+            translate_line = f"{mode} → {tgt_name or '（目标语种未填，不会翻译）'}"
         text = (
             "【豆包语音】\n"
             f"- 用法：/说 文本 或 /语音 文本\n"
             f"- API Key：{'已配置' if self._api_key() else '未配置'}\n"
-            f"- 当前音色：{self._get('doubao', 'voice', DEFAULT_VOICE_DISPLAY)}\n"
+            f"- 当前音色：{self._get('voice_tone', 'voice', DEFAULT_VOICE_DISPLAY)}"
+            f"（Resource ID：{self._get('doubao', 'resource_id', DOUBAO_RESOURCE_PRESET)}）\n"
+            f"- 语音翻译：{translate_line}\n"
             f"- 预置音色：{voice_list}\n"
             f"- 情感（可选）：{emotion_list}\n"
-            "- 换音色/情感：WebUI 插件配置里修改即可"
+            "- 换音色/情感/翻译：WebUI 插件配置里修改即可（改完即时生效）"
         )
         await self.ctx.send.text(text, stream_id)
         return True, "已发送帮助", True
