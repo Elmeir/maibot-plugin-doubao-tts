@@ -1,5 +1,30 @@
 # 更新日志
 
+## v1.6.2 (2026-09-16) 移植上游修复：豆包参数位置 / Markdown 过滤 / 跨语种
+
+同步上游（ZhaoCang-QWQ/doubao-tts v1.7.1）三项关键修复，感谢原作者：
+
+1. **⚠️ 参数位置修复（关键 bug）**：官方接口要求 emotion / emotion_scale /
+   speech_rate / loudness_rate 全部放在 `req_params.audio_params` 内。旧版误放在
+   `req_params` 顶层、且语速/音量用了旧接口的字段名（`speed_ratio`/`volume_ratio`）
+   与倍率值，被服务端**静默忽略** → 情感/语速/音量设置实际不生效。现移入
+   `audio_params` 并改用官方字段名（-50~100 整数，0=正常）。
+2. **additions.disable_markdown_filter=true**：过滤麦麦回复里的 `**加粗**`、`# 标题`
+   等 Markdown 符号，否则会被逐字念出来（additions 为 JSON 字符串）。
+3. **跨语种 explicit_language（仅日/韩）**：新增 `detect_language()` 按**字符占比**
+   判断主体语种，文本以日语/韩语为主时显式传 `ja`/`ko`（日语不传发音明显退化，
+   上游实测结论）；中英文默认不传（官方默认处理正常），其他语种不做检测。
+   对照官方文档修正：文档警告"启用后仅朗读指定语种，其他语种内容会被跳过或合成
+   失败"，故不能按"是否含有"判断——中文夹少量外语字符时不指定，避免中文被跳过
+   （比上游实现更稳）。
+4. 对照官方文档（单向流式语音合成HTTP）的其余加固：`ogg_opus` 格式强制 48000
+   采样率（官方仅支持该值）；确认 `speech_rate`/`loudness_rate`（[-50,100] 整数）
+   与 `additions`（JSON 字符串）结构与官方一致；合成日志补充语速/音量/语种；
+   缓存键随 req_params 结构变化自然隔离，无需迁移。
+
+上游的语音翻译功能（v1.6.0/1.7.0，`[translate]` 段）未移植：需要 `ctx.llm.generate`
+新能力与重启，按需后续再引入。
+
 ## v1.6.1 (2026-09-16) /说 /语音帮助 声明为受保护命令（permission=operator）
 
 1. **`/说`（doubao_tts_say）与 `/语音帮助`（doubao_tts_help）声明

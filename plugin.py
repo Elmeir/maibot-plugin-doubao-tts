@@ -144,6 +144,39 @@ def _split_sentences(text: str, max_len: int) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def detect_language(text: str) -> str:
+    """按字符占比粗略判断文本是否以日语/韩语为主，返回火山 ``explicit_language`` 取值。
+
+    返回 ``""`` 表示"不指定"（交给火山默认处理）。仅覆盖 ja/ko 两类：
+
+      · 日语文本 **不传** explicit_language → 发音明显退化，须传 ``ja``（上游实测）；
+      · 韩语文本同理传 ``ko``；
+      · 中英文（不传）→ 官方默认处理正常，无需指定；其他语种罕见，不做检测。
+
+    ⚠️ 官方文档警告：启用 explicit_language 后"仅朗读指定语种的文本，其他语种的
+    内容会被跳过或合成失败"。所以这里必须判断**主体语种**而不是"是否含有"——
+    中文里夹几个假名/谚文时绝不能整段指定该语种，否则中文内容会被跳过。
+    """
+    if not text:
+        return ""
+
+    def count(lo: str, hi: str) -> int:
+        return sum(1 for ch in text if lo <= ch <= hi)
+
+    han = count("\u4e00", "\u9fff")      # 中日韩汉字（中文与日语汉字共用）
+    kana = count("\u3040", "\u30ff")     # 平假名 / 片假名
+    hangul = count("\uac00", "\ud7af")   # 谚文
+
+    # 日语：存在假名，且假名数量超过汉字（日语语法成分全是假名，正文假名必然多于汉字；
+    # 中文夹少量假名时汉字远多于假名，不会误判）。判不出时退回默认处理，安全。
+    if kana > 0 and kana > han:
+        return "ja"
+    # 韩语：谚文字符多于汉字即视为以韩语为主
+    if hangul > 0 and hangul > han:
+        return "ko"
+    return ""
+
+
 # ─── 配置模型 ────────────────────────────────────────────────────────────────
 
 
@@ -955,30 +988,45 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         voice_type = _resolve_voice_type(str(self._get("doubao", "voice", DEFAULT_VOICE_DISPLAY)))
         audio_format = str(self._get("doubao", "audio_format", "mp3")).strip() or "mp3"
         sample_rate = int(self._get("doubao", "sample_rate", 24000) or 24000)
+        if audio_format == "ogg_opus":
+            # 官方文档：ogg_opus 仅支持 48000 采样率
+            sample_rate = 48000
         timeout = float(self._get("behavior", "timeout_seconds", 30.0) or 30.0)
 
+        audio_params: Dict[str, Any] = {"format": audio_format, "sample_rate": sample_rate}
         req_params: Dict[str, Any] = {
             "text": text,
             "speaker": voice_type,
-            "audio_params": {"format": audio_format, "sample_rate": sample_rate},
+            "audio_params": audio_params,
         }
+        # ⚠️ v1.6.2 修复（移植上游 v1.4.1）：官方接口要求 emotion / emotion_scale /
+        #    speech_rate / loudness_rate 全部放在 req_params.audio_params 内。旧版误放在
+        #    req_params 顶层、且语速/音量用了旧接口的字段名（speed_ratio / volume_ratio）
+        #    与倍率值，会被服务端静默忽略 → 设置无效。
         # 情感：LLM 覆盖优先，否则用主页「情感」固定值（"麦麦自主"/"无"=不带固定情感）
         emotion_cfg = self._fixed_emotion(ov)
         if emotion_cfg:
-            emotion_val = PRESET_EMOTIONS.get(emotion_cfg, emotion_cfg)
-            req_params["emotion"] = emotion_val
+            audio_params["emotion"] = PRESET_EMOTIONS.get(emotion_cfg, emotion_cfg)
             # 情感强度（豆包专用）：LLM 覆盖优先，否则主页「情感强度」固定档位
             scale = self._fixed_emotion_scale(ov)
             if scale is not None:
-                req_params["emotion_scale"] = scale
-        # 语速 → ratio（豆包专用，仅手动配置）
+                audio_params["emotion_scale"] = scale
+        # 语速：-50~100 的整数（0=正常，100=2.0 倍速）——官方字段名 speech_rate
         rate = float(self._get("doubao", "speech_rate", 0.0) or 0.0)
         if rate:
-            req_params["speed_ratio"] = round(1.0 + rate / 100.0, 4)
-        # 音量 → ratio（豆包专用，仅手动配置）
+            audio_params["speech_rate"] = int(max(-50, min(100, round(rate))))
+        # 音量：-50~100 的整数（0=正常，100=2.0 倍）——官方字段名 loudness_rate
         vol = float(self._get("doubao", "loudness", 0.0) or 0.0)
         if vol:
-            req_params["volume_ratio"] = round(1.0 + vol / 100.0, 4)
+            audio_params["loudness_rate"] = int(max(-50, min(100, round(vol))))
+        # additions（官方要求是 JSON 字符串）：
+        #  · disable_markdown_filter：过滤麦麦回复里的 **加粗**、# 标题等，否则会被逐字念出来；
+        #  · explicit_language：文本是日语等非中英语种时必须显式指定，否则发音明显退化（实测结论）。
+        additions: Dict[str, Any] = {"disable_markdown_filter": True}
+        detected_lang = detect_language(text)
+        if detected_lang:
+            additions["explicit_language"] = detected_lang
+        req_params["additions"] = json.dumps(additions, ensure_ascii=False)
 
         # 本地缓存：同样的文本+音色+情感+语速直接复用上次的音频，不重复调 API
         cache_dir = self._cache_dir()
@@ -998,7 +1046,14 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             "X-Api-Request-Id": str(uuid.uuid4()),
         }
         payload = {"req_params": req_params}
-        self.ctx.logger.info("[豆包TTS] 合成请求: %d字 | %s | %s | 情感=%s", len(text), resource_id, voice_type, req_params.get("emotion", "-"))
+        self.ctx.logger.info(
+            "[豆包TTS] 合成请求: %d字 | %s | %s | 情感=%s | 语速=%s | 音量=%s | 语种=%s",
+            len(text), resource_id, voice_type,
+            audio_params.get("emotion", "-"),
+            audio_params.get("speech_rate", 0),
+            audio_params.get("loudness_rate", 0),
+            detected_lang or "默认（不指定）",
+        )
 
         try:
             async with aiohttp.ClientSession() as session:
