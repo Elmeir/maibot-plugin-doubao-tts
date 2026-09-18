@@ -232,6 +232,13 @@ class PluginSectionConfig(PluginConfigBase):
             return "仅手动"
         return v
 
+    @field_validator("voice_content_source", mode="before")
+    @classmethod
+    def _normalize_voice_content_source(cls, v: Any) -> Any:
+        """手填英文值 reply/replyer → 回复生成；其余 → 工具文本。"""
+        s = str(v or "").strip().lower()
+        return "回复生成" if ("reply" in s or "回复" in s) else "工具文本"
+
     enabled: bool = Field(
         default=True,
         description="是否启用插件（总开关；关闭=插件彻底卸载、命令消失）",
@@ -272,6 +279,19 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "自主语音方式",
             "hint": "LLM 自行判断（推荐）｜概率触发｜仅手动",
+        },
+    )
+    voice_content_source: Literal["工具文本", "回复生成"] = Field(
+        default="工具文本",
+        description=(
+            "麦麦自主语音（doubao_tts_speak 工具）的内容来源："
+            "工具文本=LLM 调用工具时把要说的内容作为 text 传入，插件直接朗读（现状）；"
+            "回复生成=LLM 只决定“本轮用语音回复”，具体说什么由麦麦的 reply 流程生成，"
+            "插件在发送时自动把整条回复逐段转成语音"
+        ),
+        json_schema_extra={
+            "label": "工具语音内容来源",
+            "hint": "工具文本=LLM 传 text 直接朗读（现状）｜回复生成=LLM 只决定用语音，说什么由 reply 生成后自动转语音",
         },
     )
     emotion_scale: Literal["麦麦自主", "1", "2", "3", "4", "5"] = Field(
@@ -527,9 +547,15 @@ class DoubaoTTSPlugin(MaiBotPlugin):
 
     def __init__(self) -> None:
         super().__init__()
-        # 会话 → 概率掷骰命中时间戳（该会话麦麦下一条文字回复将转语音）
+        # 会话 → 命中时间戳（该会话麦麦下一条文字回复将转语音）：
+        # 来源有两处——概率模式掷骰命中，或「工具语音内容来源=回复生成」时 Tool 打的标
         self._pending_voice: Dict[str, float] = {}
-        # 防递归：正在发送"概率语音"的标记
+        # 会话 → 本次待语音的合成覆盖参数（emotion/emotion_scale）：
+        # 仅 Tool「回复生成」模式会写入；存在该键即表示标记来自回复生成模式
+        self._pending_voice_overrides: Dict[str, Dict[str, Any]] = {}
+        # 会话集合：插件自身发的提示/帮助/降级文本，不参与"本轮转语音"替换
+        self._suppress_convert_streams: set = set()
+        # 防递归：正在处理"待语音"消息的标记
         self._sending_pending_voice: bool = False
         # 会话 → 上次语音合成时间戳（冷却限流，防刷费用/刷屏）
         self._last_speech_at: Dict[str, float] = {}
@@ -688,13 +714,22 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.info("[豆包TTS] 概率掷骰 p=%.2f → %s", prob, "命中" if hit else "未命中")
         return hit
 
+    def _voice_content_source(self) -> str:
+        """工具语音内容来源：text=LLM 传 text 直接朗读；reply=内容由 reply 生成后转语音。"""
+        try:
+            raw = str(self._get("plugin", "voice_content_source", "") or "").strip().lower()
+        except Exception:
+            return "text"
+        return "reply" if ("reply" in raw or "回复" in raw) else "text"
+
     def _is_pending_stream(self, stream_id: str) -> bool:
-        """判断某会话是否处于"待语音"状态（概率命中后麦麦下一条文字转语音）。"""
+        """判断某会话是否处于"待语音"状态（麦麦下一条文字回复转语音）。"""
         ts = self._pending_voice.get(stream_id)
         if ts is None:
             return False
         if time.time() - ts > 300:  # 5 分钟窗口：命中后麦麦迟迟没回复则作废
             self._pending_voice.pop(stream_id, None)
+            self._pending_voice_overrides.pop(stream_id, None)
             return False
         return True
 
@@ -720,12 +755,12 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         "chat.receive.after_process",
         mode=HookMode.OBSERVE,
         name="doubao_tts_probability_mark",
-        description="概率模式：收到普通用户消息时按概率标记该会话本轮语音",
+        description="收到普通用户消息时：清理上一轮残留的语音标记，概率模式下按概率标记该会话本轮语音",
         order=HookOrder.LATE,
         error_policy=ErrorPolicy.SKIP,
     )
     async def _on_inbound_message(self, **kwargs: Any) -> None:
-        """入站钩子：概率模式下掷骰子，命中则给该会话打"待语音"标。"""
+        """入站钩子：新一轮先清残留标记，再按概率掷骰打"待语音"标。"""
         message = kwargs.get("message")
         if not isinstance(message, dict):
             return
@@ -735,11 +770,13 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         text, session_id = await self._extract_message_text(message)
         if not text or not session_id:
             return
+        # 新一轮开始：先清掉上一轮可能残留的标记。
+        # 跟随分段模式下标记会保留到本轮所有分段发完，所以必须在这里归零；
+        # 「回复生成」模式的标记若 planner 最终没调用 reply，也在这里作废。
+        self._pending_voice.pop(session_id, None)
+        self._pending_voice_overrides.pop(session_id, None)
         if not self._probability_enabled():
             return
-        # 新一轮开始：先清掉上一轮可能残留的标记。
-        # 跟随分段模式下标记会保留到本轮所有分段发完，所以必须在这里归零。
-        self._pending_voice.pop(session_id, None)
         if self._roll_probability():
             self._pending_voice[session_id] = time.time()
             self.ctx.logger.info("[豆包TTS] 概率命中：会话 %s 本轮回复将用语音", session_id)
@@ -753,14 +790,16 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def _on_before_send(self, **kwargs: Any) -> Dict[str, Any]:
-        """出站钩子：麦麦要发文字且该会话被标记"待语音" → 转语音并中止原文字。"""
+        """出站钩子：麦麦要发文字且该会话被标记"待语音" → 原地换成语音。"""
         if self._sending_pending_voice:
             return {"action": "continue"}
         message = kwargs.get("message")
         if not isinstance(message, dict):
             return {"action": "continue"}
         session_id = str(message.get("session_id") or "").strip()
-        if not session_id or not self._is_pending_stream(session_id):
+        if not session_id or session_id in self._suppress_convert_streams:
+            return {"action": "continue"}
+        if not self._is_pending_stream(session_id):
             return {"action": "continue"}
         # 只处理含文本的消息（纯图片/语音等放行，避免递归）
         raw_message = message.get("raw_message") or []
@@ -773,12 +812,19 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         text, _ = await self._extract_message_text(message)
         if not text:
             return {"action": "continue"}
-        follow = self._get("plugin", "follow_segmentation", False)
+        # 「回复生成」模式的标记：合成覆盖参数随标记保存；该模式要求整条回复转语音，
+        # 所以不受「跟随分段」开关限制（reply 分段发送时每段各自转语音），
+        # 否则默认只念第一段、其余分段仍是文字，与"语音回复"的预期不符。
+        by_reply_tool = session_id in self._pending_voice_overrides
+        overrides = dict(self._pending_voice_overrides.get(session_id) or {})
+        follow = bool(self._get("plugin", "follow_segmentation", False)) or by_reply_tool
         if not follow:
             # 不跟随分段：只转第一条，消费掉标记
             self._pending_voice.pop(session_id, None)
+            self._pending_voice_overrides.pop(session_id, None)
         self.ctx.logger.info(
-            "[豆包TTS] 概率语音：会话 %s 文字回复 → 语音（%d字%s）",
+            "[豆包TTS] %s：会话 %s 文字回复 → 语音（%d字%s）",
+            "回复生成" if by_reply_tool else "概率语音",
             session_id, len(text), "，跟随分段" if follow else "",
         )
         self._sending_pending_voice = True
@@ -786,18 +832,25 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             # 统一用「原地替换」而不是中止原消息（v1.4.5）。
             # 旧做法 abort 会让麦麦的 reply 工具拿到"发送失败"，planner/LLM 便会重试发送，
             # 语音和文字就会反复出现；替换则让发送链正常走完，一次成功。
-            return await self._replace_with_voice(message, text, kwargs)
+            return await self._replace_with_voice(message, text, kwargs, overrides=overrides)
         finally:
             self._sending_pending_voice = False
 
     async def _replace_with_voice(
-        self, message: Dict[str, Any], text: str, kwargs: Dict[str, Any]
+        self,
+        message: Dict[str, Any],
+        text: str,
+        kwargs: Dict[str, Any],
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """把一条待发的文字消息原地换成语音消息（用于跟随分段模式）。
+        """把一条待发的文字消息原地换成语音消息。
 
         与「中止原消息 + 自己另发」不同，这里让原消息继续走完发送流程：
         分段插件的补发、宿主的后处理都不会被打断，语音也就跟着文本一段一段发。
         合成失败时返回 continue，让原文照常发出，不会丢内容。
+
+        overrides: 本次语音的合成覆盖参数（emotion/emotion_scale），
+                   来自 Tool「回复生成」时 planner 指定的语气；缺省=用配置固定值。
         """
         if not self._active_api_key():
             self.ctx.logger.warning("[豆包TTS] 未配置 API Key，本条保持文字")
@@ -811,7 +864,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         session_id = str(message.get("session_id") or "").strip()
         voice_segments: List[Dict[str, Any]] = []
         for seg in segments:
-            success, audio, info = await self._synthesize_one(seg)
+            success, audio, info = await self._synthesize_one(seg, overrides=overrides)
             if not success or not audio:
                 self.ctx.logger.warning("[豆包TTS] 分段合成失败，整条回退为文字: %s", info)
                 return {"action": "continue"}
@@ -851,6 +904,10 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             "[豆包TTS] 插件已加载 | 引擎: %s | API Key: %s%s",
             self._engine_name(), key_state, detail,
         )
+        if self._voice_content_source() == "reply":
+            self.ctx.logger.info(
+                "[豆包TTS] 工具语音内容来源=回复生成：LLM 调用工具后由 reply 生成内容，发送时自动整条转语音"
+            )
         if not self._active_api_key():
             self.ctx.logger.warning(
                 "[豆包TTS] 尚未配置 API Key：请在插件配置「%s」页填写",
@@ -1325,14 +1382,11 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         # 失败处理
         self.ctx.logger.warning("[豆包TTS] 语音合成失败(%s): %s", source, note)
         if self._get("plugin", "fallback_to_text", True):
-            try:
-                if await self.ctx.send.text(text, stream_id):
-                    # 降级成文字时同样要知道自己说过什么，行为才一致
-                    if self._get("plugin", "sync_chat_context", True):
-                        await self._append_chat_context(stream_id, text)
-                    return True, "语音合成失败，已改为文字回复"
-            except Exception:
-                pass
+            if await self._send_plain_text(text, stream_id):
+                # 降级成文字时同样要知道自己说过什么，行为才一致
+                if self._get("plugin", "sync_chat_context", True):
+                    await self._append_chat_context(stream_id, text)
+                return True, "语音合成失败，已改为文字回复"
         await self._maybe_error(stream_id, "语音合成失败了，请稍后再试")
         return False, note
 
@@ -1341,6 +1395,20 @@ class DoubaoTTSPlugin(MaiBotPlugin):
 
         last = self._last_error_prompt_at.get(stream_id)
         return last is not None and time.time() - last < ERROR_PROMPT_DEDUPE_SECONDS
+
+    async def _send_plain_text(self, text: str, stream_id: str) -> bool:
+        """发送插件自身的提示/帮助/降级文本：直发文字，不被本轮的语音标记截获。
+
+        否则「回复生成 / 跟随分段」的标记会把错误提示、降级文本也当成麦麦的回复
+        再去合成一遍语音（白花接口调用，提示还变成了不合适的语音）。
+        """
+        self._suppress_convert_streams.add(stream_id)
+        try:
+            return bool(await self.ctx.send.text(text, stream_id))
+        except Exception:  # noqa: BLE001 提示发不出去不该影响主流程
+            return False
+        finally:
+            self._suppress_convert_streams.discard(stream_id)
 
     async def _maybe_error(self, stream_id: str, msg: str) -> bool:
         """向用户发失败提示；同一会话 30 秒内只发一次，防 LLM 重试刷屏。
@@ -1353,11 +1421,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if self._recently_prompted(stream_id):
             return False
         self._last_error_prompt_at[stream_id] = time.time()
-        try:
-            await self.ctx.send.text(msg, stream_id)
-            return True
-        except Exception:
-            return False
+        return await self._send_plain_text(msg, stream_id)
 
     # ── Command：手动 ───────────────────────────────────────────────────
 
@@ -1415,7 +1479,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
                 f"- 情感（可选）：{emotion_list}\n"
                 "- 换音色/情感：WebUI 插件配置里修改即可"
             )
-        await self.ctx.send.text(text, stream_id)
+        await self._send_plain_text(text, stream_id)
         return True, "已发送帮助", 1
 
     # ── Tool：麦麦自主 ──────────────────────────────────────────────────
@@ -1423,9 +1487,19 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     @Tool(
         "doubao_tts_speak",
         brief_description="用语音说话（豆包/MiMo TTS）",
+        # visibility="visible"：让宿主把本工具直接放进 LLM 每轮可见的工具列表
+        # （默认插件工具是 deferred，LLM 需先调 tool_search 搜索发现后才能用）。
+        # 见麦麦 src/maisaka/reasoning_engine.py 的 _build_action_tool_definitions。
+        visibility="visible",
         detailed_description=(
             "当用户明确要求“用语音/说话/朗读/语音回复”时使用。"
-            "文本宜为一句完整的话（5~80字）。若内容很长（>150字），只取其中最想强调的一句话来朗读，其余仍用文字。"
+            "若插件配置「工具语音内容来源=工具文本」（默认）：用 text 给出要朗读的文本，"
+            "宜为一句完整的话（5~80字）；若内容很长（>150字），只取其中最想强调的一句话来朗读，其余仍用文字。"
+            "若配置为「回复生成」：text 不必填（内容由麦麦的 reply 流程生成），"
+            "本工具只表示“本轮用语音回复”，可以单独调用、下一轮再调用 reply，"
+            "也可以与 reply 在同一条消息里一起调用（本工具在前更稳）以省去一轮思考；"
+            "只要本轮还没生成回复，就调用 reply（若已同时调用过则不要重复），"
+            "插件会在发送时自动把这条回复整条转成语音，不要再自己写一遍要说的内容。"
             "可选按对话氛围调节语气：emotion（情感，如安慰时平静、玩闹时开心）、emotion_scale（强度1~5，仅豆包生效）。"
             "每个参数可单独给，未给的使用插件配置里的固定值；拿不准就都省略，用默认语气即可。"
         ),
@@ -1433,8 +1507,12 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="text",
                 param_type=ToolParamType.STRING,
-                description="要转成语音朗读的文本（一句完整的话）",
-                required=True,
+                description=(
+                    "要转成语音朗读的文本（一句完整的话）。"
+                    "「工具语音内容来源=工具文本」（默认）时必填，留空本轮不会发声；"
+                    "=「回复生成」时可省略（内容由 reply 生成，给了会被忽略）"
+                ),
+                required=False,
             ),
             ToolParameterInfo(
                 name="emotion",
@@ -1463,8 +1541,6 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         del kwargs
         if not stream_id:
             return {"success": False, "message": "缺少 stream_id，无法发送语音"}
-        if not (text or "").strip():
-            return {"success": False, "message": "text 为空，未发送"}
         # 麦麦自主语音由主页「自主语音方式」管控（off=麦麦不自主）；
         # 「手动命令」开关只管 /说 手动命令，不该挡这里（修 v1.4.4：原版把它错用在 Tool 上，
         # 关掉手动命令会让麦麦每次调用本工具都失败）。
@@ -1476,6 +1552,24 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             overrides["emotion"] = (emotion or "").strip()
         if emotion_scale is not None:
             overrides["emotion_scale"] = emotion_scale
+        # 「回复生成」模式：工具只当"本轮用语音回复"的开关，内容等 reply 生成后再转语音
+        if self._voice_content_source() == "reply":
+            if (text or "").strip():
+                self.ctx.logger.info(
+                    "[豆包TTS] 回复生成模式：忽略 LLM 传入的 text（%d字），内容以 reply 生成为准",
+                    len(text.strip()),
+                )
+            return await self._tool_request_voice_reply(stream_id, overrides)
+        if not (text or "").strip():
+            # text 现为选填（回复生成模式不需要），默认模式下模型可能漏填——
+            # 明确告诉它该补什么，避免一次无谓的失败重试。
+            return {
+                "success": False,
+                "message": (
+                    "text 为空，本轮未发声。当前「工具语音内容来源=工具文本」，"
+                    "请把要朗读的文本（一句完整的话）放进 text 重新调用一次。"
+                ),
+            }
         ok, note = await self._handle_speech(text, stream_id, "Tool", overrides=overrides or None)
         if ok:
             # stop_after_execution：语音已通过 send.custom 直发到会话，本批工具执行完
@@ -1491,6 +1585,46 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if self._recently_prompted(stream_id):
             result["stop_after_execution"] = True
         return result
+
+    async def _tool_request_voice_reply(
+        self, stream_id: str, overrides: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """「回复生成」模式：只给会话打"本轮回复转语音"标，内容交给 reply 生成。
+
+        语音不在工具里合成，而是等 planner 随后调用 reply、replyer 生成回复文本后，
+        由 send_service.before_send 钩子把那条文字原地换成语音（整条回复逐段转）。
+        所以这里**不能**带 stop_after_execution——planner 必须继续调用 reply 生成内容。
+
+        失败（未配 Key / 冷却中）时不打标，reply 照常以文字发出，不会丢内容。
+        """
+        if not self._active_api_key():
+            msg = f"{self._engine_name()}语音 API Key 未配置，请先在插件配置里填写"
+            await self._maybe_error(stream_id, msg)
+            return {"success": False, "message": msg}
+        if self._cooldown_block(stream_id):
+            cd = self._cooldown_seconds()
+            self.ctx.logger.info("[豆包TTS] 触发冷却限流(回复生成)：stream=%s", stream_id)
+            return {
+                "success": False,
+                "message": (
+                    f"语音冷却中（{cd:.0f} 秒）；冷却期内重试仍会失败，"
+                    "请直接转告用户稍后再试，不要连续重试"
+                ),
+            }
+        self._pending_voice[stream_id] = time.time()
+        self._pending_voice_overrides[stream_id] = dict(overrides or {})
+        self.ctx.logger.info(
+            "[豆包TTS] 回复生成：会话 %s 已标记，待 reply 生成内容后整条转语音", stream_id
+        )
+        return {
+            "success": True,
+            "message": (
+                "已进入语音回复模式：本条回复会在发送时自动逐段转成语音。"
+                "若你还没有生成回复，请调用 reply 工具正常生成内容"
+                "（不必在 text 参数里重复写要说的内容）；"
+                "若已在本批同时调用过 reply，则无需再调用，直接结束本轮即可。"
+            ),
+        }
 
 
 def create_plugin() -> MaiBotPlugin:
