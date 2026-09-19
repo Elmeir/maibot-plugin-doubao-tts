@@ -442,7 +442,7 @@ class BehaviorSectionConfig(PluginConfigBase):
 
     command_enabled: bool = Field(
         default=True,
-        description="是否启用 /说 /语音 手动命令",
+        description="是否启用 /说 /语音 手动命令（只影响手动命令；麦麦自主语音由 auto_voice_mode 控制，不受此项影响）",
         json_schema_extra={"label": "手动命令"},
     )
     auto_voice_mode: Literal["llm", "probability", "off"] = Field(
@@ -1160,9 +1160,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             return {"success": False, "message": "缺少 stream_id，无法发送语音"}
         if not (text or "").strip():
             return {"success": False, "message": "text 为空，未发送"}
-        # Tool 模式跟随总开关：手动命令/命令开关控制 /说；自主语音方式为 off 时禁用 LLM 自主
-        if not self._get("behavior", "command_enabled", True):
-            return {"success": False, "message": "语音功能当前已禁用"}
+        # 麦麦自主语音只由「自主语音方式」管控（off=麦麦不自主）；
+        # 「手动命令」开关只管 /说 命令，不该挡这里——否则关掉手动命令后，
+        # 麦麦每次调用本工具都会失败（返回"语音功能当前已禁用"）。
         if self._auto_voice_mode() == "off":
             return {"success": False, "message": "麦麦自主语音已关闭（behavior.auto_voice_mode=off），请使用 /说 手动命令"}
         # 语速/音量为连续数值，仅支持手动固定（不在此工具参数中提供）
