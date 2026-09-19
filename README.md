@@ -91,6 +91,7 @@ emotion_mode = "fixed"                # 情感来源：fixed=用 [voice_tone] em
 emotion_scale_mode = "fixed"          # 情感强度来源：fixed / auto（下拉）
 sync_chat_context = true              # 发语音后把原文写回麦麦的对话上下文（默认开）
 context_prefix = "[语音]"             # 写回上下文时加在原文前的标记（默认 [语音]，留空则不加）
+command_cooldown_seconds = 0          # 同一会话两次合成的最小间隔（秒），0=不限流；建议公开命令时设 10
 ```
 
 **API Key 在哪拿**：火山引擎控制台 → 豆包语音 → **API Key 管理** → 新建/复制。需先开通"语音合成大模型"服务（控制台 → 开通管理）。

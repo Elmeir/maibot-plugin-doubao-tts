@@ -49,3 +49,4 @@ fallback_to_text = true      # 合成失败时降级为文字发出
 send_error_prompt = true     # 失败时提示用户
 sync_chat_context = true     # 发语音后把原文写回麦麦的对话上下文（否则麦麦下一轮不知道自己说过什么）
 context_prefix = "[语音]"    # 写回上下文时加在原文前的标记（表明这句是语音说的）；留空则不加
+command_cooldown_seconds = 0 # 同一会话两次合成的最小间隔（秒），0=不限流；命令对所有人开放时建议设置（如 10）防刷费用

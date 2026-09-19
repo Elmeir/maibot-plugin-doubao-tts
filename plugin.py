@@ -520,6 +520,18 @@ class BehaviorSectionConfig(PluginConfigBase):
         description="写回对话上下文时加在原文前面的标记（表明这句是语音说的）；留空则不加",
         json_schema_extra={"label": "上下文标记", "placeholder": "[语音]"},
     )
+    command_cooldown_seconds: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "同一会话两次语音合成的最小间隔（秒），0=不限流（默认）。"
+            "TTS 按字符计费，手动命令对所有人开放时建议设置一个值（如 10）防刷屏/刷费用"
+        ),
+        json_schema_extra={
+            "label": "冷却限流（秒）",
+            "hint": "0=关闭。设置后同一会话在该时间内重复触发语音会被拒绝：命令回一句冷却提示，工具向 LLM 返回失败原因",
+        },
+    )
 
 
 class DoubaoTTSRootConfig(PluginConfigBase):
@@ -549,6 +561,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self._sending_pending_voice: bool = False
         # 会话 → 上次失败提示时间戳（去重窗口内不再重复提示）
         self._last_error_prompt_at: Dict[str, float] = {}
+        # 会话 → 上次语音合成时间戳（冷却限流，防刷费用/刷屏）
+        self._last_speech_at: Dict[str, float] = {}
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -560,6 +574,33 @@ class DoubaoTTSPlugin(MaiBotPlugin):
 
     def _api_key(self) -> str:
         return str(self._get("doubao", "api_key", "") or "").strip()
+
+    # ── 冷却限流 ────────────────────────────────────────────────────────
+
+    def _cooldown_seconds(self) -> float:
+        try:
+            return max(0.0, float(self._get("behavior", "command_cooldown_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _cooldown_block(self, stream_id: str) -> bool:
+        """冷却限流：同一会话在冷却窗口内拒绝再次合成（防刷费用/刷屏）。
+
+        返回 True=本次被拦截。通过检查时记录本次时间戳。
+        对手动命令与麦麦自主 Tool 调用一并生效；概率模式由宿主驱动、每轮最多一次，不在此列。
+        """
+        cd = self._cooldown_seconds()
+        if cd <= 0:
+            return False
+        now = time.time()
+        last = self._last_speech_at.get(stream_id)
+        if last is not None and now - last < cd:
+            return True
+        self._last_speech_at[stream_id] = now
+        if len(self._last_speech_at) > 256:  # 防累积：清掉早已冷却完毕的会话
+            cutoff = now - max(cd, 60.0)
+            self._last_speech_at = {k: v for k, v in self._last_speech_at.items() if v >= cutoff}
+        return False
 
     # ── 概率自主语音 ────────────────────────────────────────────────────
 
@@ -1123,6 +1164,14 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             await self._maybe_error(stream_id, msg)
             return False, "API Key 未配置"
 
+        # 冷却限流（可选，默认关闭）：同一会话短时间内重复触发一律拒绝（防刷屏/刷费用）
+        if self._cooldown_block(stream_id):
+            cd = self._cooldown_seconds()
+            self.ctx.logger.info("[豆包TTS] 触发冷却限流(%s): stream=%s", source, stream_id)
+            if source == "命令":
+                await self._maybe_error(stream_id, f"语音合成冷却中，请 {cd:.0f} 秒后再试")
+            return False, "触发限流"
+
         ov = overrides if isinstance(overrides, dict) else {}
         self.ctx.logger.info(
             "[豆包TTS] %s 触发语音: %d字 覆盖=%s", source, len(text), json.dumps({k: v for k, v in ov.items() if v is not None}, ensure_ascii=False) or "-"
@@ -1289,7 +1338,11 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         ok, note = await self._handle_speech(text, stream_id, "Tool", overrides=overrides or None)
         if ok:
             return {"success": True, "message": note}
-        return {"success": False, "message": f"语音失败：{note}"}
+        msg = f"语音失败：{note}"
+        if "限流" in note:
+            # 冷却期内重试必然还是失败，明确引导 LLM 别连续重试
+            msg += "；冷却期内重试仍会失败，请直接转告用户稍后再试，不要连续重试"
+        return {"success": False, "message": msg}
 
 
 def create_plugin() -> MaiBotPlugin:
