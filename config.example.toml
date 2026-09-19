@@ -45,3 +45,20 @@ cache_max_files = 500         # 缓存文件数上限，超出按最旧优先清
 # /说 与 /语音帮助 已声明为受保护命令（permission=operator），授权在麦麦主配置
 # 「插件权限」里管理：全局管理员（permission，如 ["qq:123456"]）或
 # command_permissions 按命令放行用户/聊天（WebUI 机器人配置 → 命令权限）
+
+[debug]                       # 调试
+enabled = false               # 诊断日志（工具/命令调用细节；日志搜「豆包TTS·调试」）
+
+# 以下为调试页「组件信息」只读展示段：内容由插件加载时自动写入（勿手改）
+[tool_doubao_tts_speak]
+visibility = ""
+description = ""
+parameters = ""
+
+[command_doubao_tts_say]
+description = ""
+pattern = ""
+
+[command_doubao_tts_help]
+description = ""
+pattern = ""

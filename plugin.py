@@ -495,6 +495,219 @@ class BehaviorSectionConfig(PluginConfigBase):
     )
 
 
+class DebugSectionConfig(PluginConfigBase):
+    """调试配置。"""
+
+    __ui_label__ = "调试"
+    __ui_icon__ = "terminal"
+    __ui_order__ = 4
+
+    enabled: bool = Field(
+        default=False,
+        description="输出诊断日志（工具与命令调用细节）",
+        json_schema_extra={
+            "label": "诊断日志",
+            "hint": "开=工具/命令调用时输出参数摘要（日志搜「豆包TTS·调试」）；排查触发问题时打开",
+        },
+    )
+
+
+class ToolInfoBaseConfig(PluginConfigBase):
+    """工具信息基类（只读展示：LLM 视角的工具定义，加载时自动写入）。
+
+    WebUI 对字段的显示值取自配置值本身（schema.default 会被空配置值覆盖），
+    展示文本由 on_load 写入 config.toml 对应段；读取处忽略这些字段（纯展示）。
+    """
+
+    __ui_icon__ = "wrench"
+    __ui_order__ = 10
+
+    visibility: str = Field(
+        default="",
+        description="工具对 LLM 的可见性（运行时生成，只读）",
+        json_schema_extra={
+            "label": "可见性",
+            "hint": "visible = 始终提供给 LLM；deferred = 按需发现（可被 tool_search 搜到）",
+            "disabled": True,
+            "rows": 2,
+        },
+    )
+    description: str = Field(
+        default="",
+        description="LLM 看到的工具描述（运行时生成，只读）",
+        json_schema_extra={
+            "label": "描述",
+            "hint": "LLM 实际看到的工具描述；每次插件加载时自动刷新",
+            "disabled": True,
+            "rows": 5,
+        },
+    )
+    parameters: str = Field(
+        default="",
+        description="工具参数清单（运行时生成，只读）",
+        json_schema_extra={
+            "label": "参数",
+            "hint": "每个参数一行：名称（类型，必填/可选）：说明",
+            "disabled": True,
+            "rows": 5,
+        },
+    )
+
+
+class ToolDoubaoTtsSpeakConfig(ToolInfoBaseConfig):
+    """语音工具（doubao_tts_speak）。"""
+
+    __ui_label__ = "doubao_tts_speak"
+
+
+class CommandInfoBaseConfig(PluginConfigBase):
+    """命令信息基类（只读展示：命令描述与匹配模式）。"""
+
+    __ui_icon__ = "terminal"
+    __ui_order__ = 11
+
+    description: str = Field(
+        default="",
+        description="命令描述（运行时生成，只读）",
+        json_schema_extra={
+            "label": "描述",
+            "hint": "命令的说明文本；每次插件加载时自动刷新",
+            "disabled": True,
+            "rows": 2,
+        },
+    )
+    pattern: str = Field(
+        default="",
+        description="命令匹配模式（运行时生成，只读）",
+        json_schema_extra={
+            "label": "匹配模式",
+            "hint": "触发该命令的正则模式",
+            "disabled": True,
+            "rows": 2,
+        },
+    )
+
+
+class CommandDoubaoTtsSayConfig(CommandInfoBaseConfig):
+    """说话命令（doubao_tts_say）。"""
+
+    __ui_label__ = "doubao_tts_say"
+
+
+class CommandDoubaoTtsHelpConfig(CommandInfoBaseConfig):
+    """帮助命令（doubao_tts_help）。"""
+
+    __ui_label__ = "doubao_tts_help"
+
+
+def _collect_tool_info(handler: Any) -> Dict[str, str]:
+    """从组件声明生成单个工具的展示字段（可见性 / 描述 / 参数）。"""
+    info = getattr(handler, "__maibot_component_info__", None)
+    if info is None:
+        return {}
+    metadata = getattr(info, "metadata", None)
+    visibility = ""
+    if isinstance(metadata, dict):
+        visibility = str(metadata.get("visibility") or "").strip()
+    description = str(
+        getattr(info, "brief_description", "") or getattr(info, "description", "") or ""
+    ).strip() or "（无描述）"
+    parameters = getattr(info, "parameters", None) or []
+    param_lines: List[str] = []
+    for param in parameters:
+        param_name = str(getattr(param, "name", "") or "")
+        param_type = getattr(param, "param_type", None)
+        type_text = (
+            getattr(param_type, "value", None)
+            or getattr(param_type, "name", None)
+            or "string"
+        )
+        required = "必填" if bool(getattr(param, "required", False)) else "可选"
+        param_desc = str(getattr(param, "description", "") or "")
+        param_lines.append(f"{param_name}（{type_text}，{required}）: {param_desc}")
+    return {
+        "visibility": visibility or "deferred（未显式声明时的宿主默认）",
+        "description": description,
+        "parameters": "\n".join(param_lines) if param_lines else "（无参数）",
+    }
+
+
+def _collect_command_info(handler: Any) -> Dict[str, str]:
+    """从组件声明生成单个命令的展示字段（描述 / 匹配模式）。"""
+    info = getattr(handler, "__maibot_component_info__", None)
+    if info is None:
+        return {}
+    return {
+        "description": str(getattr(info, "description", "") or "").strip()
+        or "（无描述）",
+        "pattern": str(getattr(info, "command_pattern", "") or "").strip() or "（无）",
+    }
+
+
+def _collect_all_component_info() -> Dict[str, Dict[str, str]]:
+    """收集全部组件的展示字段（段名 → 字段字典）。"""
+    return {
+        "tool_doubao_tts_speak": _collect_tool_info(DoubaoTTSPlugin._tool_speak),
+        "command_doubao_tts_say": _collect_command_info(DoubaoTTSPlugin._cmd_say),
+        "command_doubao_tts_help": _collect_command_info(DoubaoTTSPlugin._cmd_help),
+    }
+
+
+def _sync_component_info_sections(
+    values: Dict[str, Dict[str, Any]], config_path: Optional[Path] = None
+) -> None:
+    """把只读展示字段写入 config.toml 对应段（每段内容有变化才写）。
+
+    实现与 reply-control 一致：段内容完全由本函数管理（整段重写），文本用
+    JSON 转义（TOML 基础字符串兼容）；失败静默（不影响插件运行）。
+    """
+    if not values:
+        return
+    try:
+        target = config_path or (Path(__file__).parent / "config.toml")
+        if not target.exists():
+            return
+        content = target.read_text(encoding="utf-8")
+        original = content
+        for section, fields in values.items():
+            if not fields:
+                continue
+            body = [
+                f"{name} = " + json.dumps(value, ensure_ascii=False)
+                for name, value in fields.items()
+            ]
+            content = _replace_section_body(content, section, body)
+        if content != original:
+            target.write_text(content, encoding="utf-8")
+    except Exception:
+        pass  # 展示同步失败不影响插件运行
+
+
+def _replace_section_body(content: str, section: str, body: List[str]) -> str:
+    """重写 TOML 指定段的段体（段不存在时追加）；内容未变化时原样返回。"""
+    lines = content.splitlines()
+    start: Optional[int] = None
+    end = len(lines)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == f"[{section}]":
+            start = index
+            continue
+        if start is not None and stripped.startswith("[") and stripped.endswith("]"):
+            end = index
+            break
+    trailing = "\n" if content.endswith("\n") else ""
+    if start is None:
+        suffix = "" if content.endswith("\n") else "\n"
+        return f"{content}{suffix}\n[{section}]\n" + "\n".join(body) + "\n"
+    current = [line for line in lines[start + 1 : end] if line.strip()]
+    if current == body:
+        return content  # 未变化：不写盘、不触发配置事件
+    if end >= len(lines):
+        return "\n".join([*lines[: start + 1], *body]) + trailing
+    return "\n".join([*lines[: start + 1], *body, "", *lines[end:]]) + trailing
+
+
 class DoubaoTTSRootConfig(PluginConfigBase):
     """插件根配置。"""
 
@@ -502,6 +715,10 @@ class DoubaoTTSRootConfig(PluginConfigBase):
     doubao: DoubaoSectionConfig = Field(default_factory=DoubaoSectionConfig, json_schema_extra={"label": "豆包语音"})
     mimo: MimoSectionConfig = Field(default_factory=MimoSectionConfig, json_schema_extra={"label": "MiMo 语音"})
     behavior: BehaviorSectionConfig = Field(default_factory=BehaviorSectionConfig, json_schema_extra={"label": "高级"})
+    debug: DebugSectionConfig = Field(default_factory=DebugSectionConfig)
+    tool_doubao_tts_speak: ToolDoubaoTtsSpeakConfig = Field(default_factory=ToolDoubaoTtsSpeakConfig)
+    command_doubao_tts_say: CommandDoubaoTtsSayConfig = Field(default_factory=CommandDoubaoTtsSayConfig)
+    command_doubao_tts_help: CommandDoubaoTtsHelpConfig = Field(default_factory=CommandDoubaoTtsHelpConfig)
 
 
 # ─── 主插件 ──────────────────────────────────────────────────────────────────
@@ -541,8 +758,34 @@ class DoubaoTTSPlugin(MaiBotPlugin):
                     {"id": "doubao", "title": "豆包语音", "sections": ["doubao"], "order": 1},
                     {"id": "mimo", "title": "MiMo 语音", "sections": ["mimo"], "order": 2},
                     {"id": "advanced", "title": "高级", "sections": ["behavior"], "order": 3},
+                    {
+                        "id": "debug",
+                        "title": "调试",
+                        "sections": [
+                            "debug",
+                            "tool_doubao_tts_speak",
+                            "command_doubao_tts_say",
+                            "command_doubao_tts_help",
+                        ],
+                        "order": 4,
+                    },
                 ],
             }
+            # 组件信息卡：字段 default 注入（双保险；框内值由 on_load 写入配置值）
+            sections = schema.get("sections")
+            for section_name, info_fields in _collect_all_component_info().items():
+                if not isinstance(sections, dict):
+                    break
+                section = sections.get(section_name)
+                if not isinstance(section, dict):
+                    continue
+                section_fields = section.get("fields")
+                if not isinstance(section_fields, dict):
+                    continue
+                for field_name, value in info_fields.items():
+                    field = section_fields.get(field_name)
+                    if isinstance(field, dict):
+                        field["default"] = value
         return schema
 
     def __init__(self) -> None:
@@ -913,6 +1156,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
                 "[豆包TTS] 尚未配置 API Key：请在插件配置「%s」页填写",
                 "MiMo 语音" if engine == "mimo" else "豆包语音",
             )
+        # 组件信息只读展示：WebUI 取值依赖配置值本身，加载时同步一次
+        # （内容有变化才写盘；纯展示字段，读取处忽略）
+        _sync_component_info_sections(_collect_all_component_info())
 
     async def on_unload(self) -> None:
         self.ctx.logger.info("[豆包TTS] 插件已卸载")
@@ -1537,6 +1783,12 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """LLM 调用：返回结构化结果给 LLM。"""
+        if self._get("debug", "enabled", False):
+            self.ctx.logger.info(
+                "[豆包TTS·调试] 工具调用: text=%s | engine=%s",
+                str(text or "")[:40],
+                self._engine_name(),
+            )
         stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "")
         del kwargs
         if not stream_id:
