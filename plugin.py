@@ -259,10 +259,10 @@ class PluginSectionConfig(PluginConfigBase):
     )
     emotion: Literal["麦麦自主", "无", "开心", "伤心", "生气", "害怕", "惊讶", "讨厌", "哭泣", "抱歉", "平静", "播音", "讲故事"] = Field(
         default="麦麦自主",
-        description="情感：麦麦自主=LLM 按对话氛围现场挑（推荐）；选具体情感=固定用它（手动 /说 与自主语音一致）；无=正常语气。豆包走情感参数；MiMo 转成 (风格) 标签",
+        description="情感：麦麦自主=LLM 按对话氛围现场挑（推荐）；选具体情感=固定用它（忽略 LLM 自选）；无=一律正常语气（忽略 LLM 自选）。豆包走情感参数；MiMo 转成 (风格) 标签",
         json_schema_extra={
             "label": "情感",
-            "hint": "麦麦自主=LLM 现场挑｜无=正常语气｜其余=固定情感",
+            "hint": "麦麦自主=LLM 现场挑｜无=一律正常语气（忽略 LLM）｜其余=固定情感（忽略 LLM）",
         },
     )
     command_enabled: bool = Field(
@@ -292,19 +292,6 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "工具语音内容来源",
             "hint": "工具文本=LLM 传 text 直接朗读（现状）｜回复生成=LLM 只决定用语音，说什么由 reply 生成后自动转语音",
-        },
-    )
-    stop_planner_after_voice: bool = Field(
-        default=True,
-        description=(
-            "语音发出后是否结束本轮 planner（结束本轮思考）。"
-            "开启（默认）：语音发送成功即结束本轮，LLM 不会再调 reply 把同样的内容发一遍文字；"
-            "关闭：语音照发，但麦麦可能继续思考并再补一条文字回复。"
-            "「工具语音内容来源=回复生成」时不受此开关影响（该模式必须继续调用 reply 生成内容）"
-        ),
-        json_schema_extra={
-            "label": "语音后结束本轮",
-            "hint": "开（推荐）=语音发出即结束本轮，不再补发文字｜关=语音照发、交给麦麦继续；「回复生成」模式不受影响",
         },
     )
     emotion_scale: Literal["麦麦自主", "1", "2", "3", "4", "5"] = Field(
@@ -613,6 +600,11 @@ class CommandDoubaoTtsHelpConfig(CommandInfoBaseConfig):
     __ui_label__ = "doubao_tts_help"
 
 
+_LOOP_GUARD_SECONDS = 8.0
+"""循环防护窗口：同流极短时间内（秒级）的重复工具调用几乎必然是 planner
+循环病（同一轮内连续发声），直接拒绝；正常新一轮请求间隔远大于该阈值。"""
+
+
 def _collect_tool_info(handler: Any) -> Dict[str, str]:
     """从组件声明生成单个工具的展示字段（可见性 / 描述 / 参数）。"""
     info = getattr(handler, "__maibot_component_info__", None)
@@ -809,6 +801,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         # 会话 → 本次待语音的合成覆盖参数（emotion/emotion_scale）：
         # 仅 Tool「回复生成」模式会写入；存在该键即表示标记来自回复生成模式
         self._pending_voice_overrides: Dict[str, Dict[str, Any]] = {}
+        # 会话 → 最近一次成功发语音的时间戳（循环防护闸门用）：
+        # 同流极短时间内（秒级）的重复工具调用几乎必然是 planner 循环病
+        self._recent_voice_at: Dict[str, float] = {}
         # 会话集合：插件自身发的提示/帮助/降级文本，不参与"本轮转语音"替换
         self._suppress_convert_streams: set = set()
         # 防递归：正在处理"待语音"消息的标记
@@ -925,29 +920,34 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         return "llm"
 
     def _fixed_emotion(self, overrides: Dict[str, Any]) -> str:
-        """解析本次合成使用的情感（空串=不带固定情感）。
+        """解析本次合成使用的情感（空串=不带情感）。
 
-        LLM 覆盖（overrides.emotion）优先；否则取主页「情感」固定值，
-        仅当它是具体情感（非"麦麦自主"/"无"）时返回。
+        主页「情感」是总闸：
+        - "无"：一律不带情感（**忽略 LLM 覆盖**），正常语气；
+        - "麦麦自主"：LLM 覆盖优先（overrides.emotion），LLM 未给则不下发；
+        - 具体情感：固定用它（LLM 覆盖忽略——「固定用它」以主页为准）。
         """
-        emotion = str(overrides.get("emotion") or "").strip()
-        if not emotion or emotion == EMOTION_NONE:
-            fixed = str(self._get("plugin", "emotion", "") or "").strip()
-            if fixed and fixed not in (EMOTION_NONE, EMOTION_AUTO, "none", "auto"):
-                return fixed
+        fixed = str(self._get("plugin", "emotion", "") or "").strip()
+        if fixed in (EMOTION_NONE, "", "none"):
             return ""
-        return emotion
+        if fixed in (EMOTION_AUTO, "auto"):
+            emotion = str(overrides.get("emotion") or "").strip()
+            if not emotion or emotion == EMOTION_NONE:
+                return ""
+            return emotion
+        return fixed
 
     def _fixed_emotion_scale(self, overrides: Dict[str, Any]) -> Optional[float]:
         """解析本次合成使用的情感强度 1~5（豆包专用）。
 
-        LLM 覆盖（overrides.emotion_scale）优先；否则取主页「情感强度」固定档位；
-        "麦麦自主"且 LLM 未给时返回 None=不下发该参数。
+        主页「情感强度」是总闸："麦麦自主"=LLM 覆盖优先（未给则不下发）；
+        固定档位=固定用它（LLM 覆盖忽略）。仅在情感生效时才会随之下发
+        （调用方保证），故无需单独处理「情感=无」的情况。
         """
-        raw = overrides.get("emotion_scale")
-        if raw is None:
-            raw = str(self._get("plugin", "emotion_scale", "") or "").strip()
-            if not raw or raw == EMOTION_AUTO:
+        raw = str(self._get("plugin", "emotion_scale", "") or "").strip()
+        if not raw or raw == EMOTION_AUTO:
+            raw = overrides.get("emotion_scale")
+            if raw is None:
                 return None
         try:
             val = float(raw)
@@ -977,17 +977,6 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         except Exception:
             return "text"
         return "reply" if ("reply" in raw or "回复" in raw) else "text"
-
-    def _stop_planner_after_voice(self) -> bool:
-        """语音发出后是否结束本轮 planner（主页开关，默认开）。
-
-        开启时工具成功返回带 stop_after_execution，本批工具执行完即结束 planner；
-        关闭时语音照发、planner 继续（LLM 可能再补一条文字回复）。
-        """
-        try:
-            return bool(self._get("plugin", "stop_planner_after_voice", True))
-        except Exception:
-            return True
 
     def _is_pending_stream(self, stream_id: str) -> bool:
         """判断某会话是否处于"待语音"状态（麦麦下一条文字回复转语音）。"""
@@ -1330,7 +1319,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         #    speech_rate / loudness_rate 全部放在 req_params.audio_params 内。旧版误放在
         #    req_params 顶层、且语速/音量用了旧接口的字段名（speed_ratio / volume_ratio）
         #    与倍率值，会被服务端静默忽略 → 设置无效。
-        # 情感：LLM 覆盖优先，否则用主页「情感」固定值（"麦麦自主"/"无"=不带固定情感）
+        # 情感：主页「情感」是总闸（"无"/固定值忽略 LLM 覆盖，"麦麦自主"=LLM 挑）
         emotion_cfg = self._fixed_emotion(ov)
         if emotion_cfg:
             audio_params["emotion"] = PRESET_EMOTIONS.get(emotion_cfg, emotion_cfg)
@@ -1787,7 +1776,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="emotion",
                 param_type=ToolParamType.STRING,
-                description="情感语气（按对话氛围选一个）：开心/伤心/生气/害怕/惊讶/讨厌/哭泣/抱歉/平静/播音/讲故事",
+                description="情感语气（按对话氛围选一个）：开心/伤心/生气/害怕/惊讶/讨厌/哭泣/抱歉/平静/播音/讲故事。仅在主页「情感=麦麦自主」时生效",
                 required=False,
                 enum_values=list(PRESET_EMOTIONS.keys()),
             ),
@@ -1846,24 +1835,43 @@ class DoubaoTTSPlugin(MaiBotPlugin):
                     "请把要朗读的文本（一句完整的话）放进 text 重新调用一次。"
                 ),
             }
+        # 循环防护：同流极短时间内的重复调用直接拒绝合成，返回劝阻文本让
+        # planner 收敛（success=True 避免 LLM 误读为失败向用户道歉）
+        last_voice_at = self._recent_voice_at.get(stream_id)
+        if (
+            last_voice_at is not None
+            and time.monotonic() - last_voice_at < _LOOP_GUARD_SECONDS
+        ):
+            self.ctx.logger.info("[豆包TTS] 循环防护: 同流极短时间内重复调用，已拒绝合成")
+            return {
+                "success": True,
+                "message": (
+                    "刚刚已发送过语音，本次调用未执行（疑似对同一请求的重复行动）。"
+                    "请勿再次调用本工具或连续发送语音，除非对话确有新的需要处理的内容。"
+                ),
+            }
         ok, note = await self._handle_speech(text, stream_id, "Tool", overrides=overrides or None)
         if ok:
-            # stop_after_execution：语音已通过 send.custom 直发到会话，本批工具执行完
-            # 即结束 planner——否则 LLM 会再调 reply 发一遍文字，内容与语音重复。
-            # 主页「语音后结束本轮」开关可关掉（关闭后语音照发，麦麦可能再补一条文字）。
-            result: Dict[str, Any] = {"success": True, "message": note}
-            if self._stop_planner_after_voice():
-                result["stop_after_execution"] = True
-            return result
-        # 失败路径默认不结束 planner，让 LLM 转告用户；但若插件刚给用户发过失败提示
-        # （去重窗口内），再 reply 只会与提示重复，此时同样结束 planner（开关关闭时不结束）。
+            # 收敛型返回（与 reply-control select_emoji 同方案）：明确「请求已由
+            # 本次语音响应、无需再用 reply 重复」，planner 自然收敛——不用
+            # stop_after_execution（那会彻底结束本轮、下条消息要重新过触发门控，
+            # 牺牲接话及时性）；LLM 不收敛时由循环防护闸门兜底
+            self._recent_voice_at[stream_id] = time.monotonic()
+            return {
+                "success": True,
+                "message": (
+                    f"{note}。用户的请求已由本次语音响应；请勿再次调用本工具，"
+                    "也无需再用 reply 重复相同内容，除非对话确有新的需要处理的内容。"
+                ),
+            }
+        # 失败路径不结束 planner；若插件刚给用户发过失败提示（去重窗口内），
+        # 明确告知无需转告——LLM 看到即收敛，避免与提示内容重复
         msg = f"语音失败：{note}"
         if "限流" in note:
-            msg += "；冷却期内重试仍会失败，请直接转告用户稍后再试，不要连续重试"
-        fail_result: Dict[str, Any] = {"success": False, "message": msg}
-        if self._stop_planner_after_voice() and self._recently_prompted(stream_id):
-            fail_result["stop_after_execution"] = True
-        return fail_result
+            msg += "；冷却期内重试仍会失败，请不要连续重试"
+        if self._recently_prompted(stream_id):
+            msg += "；该失败已直接提示过用户，无需再调用 reply 转告"
+        return {"success": False, "message": msg}
 
     async def _tool_request_voice_reply(
         self, stream_id: str, overrides: Dict[str, Any]
