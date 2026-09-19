@@ -506,6 +506,20 @@ class BehaviorSectionConfig(PluginConfigBase):
         description="合成失败时向用户发一句提示",
         json_schema_extra={"label": "失败提示"},
     )
+    sync_chat_context: bool = Field(
+        default=True,
+        description=(
+            "发送语音后把原文写回麦麦的对话上下文。"
+            "语音消息本身不带文字（可见文本只有「[语音消息]」），不写回去的话，"
+            "麦麦下一轮不知道自己说过什么"
+        ),
+        json_schema_extra={"label": "同步对话上下文"},
+    )
+    context_prefix: str = Field(
+        default="[语音]",
+        description="写回对话上下文时加在原文前面的标记（表明这句是语音说的）；留空则不加",
+        json_schema_extra={"label": "上下文标记", "placeholder": "[语音]"},
+    )
 
 
 class DoubaoTTSRootConfig(PluginConfigBase):
@@ -701,6 +715,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             "[豆包TTS] 概率语音：会话 %s 已把文字回复换成 %d 条语音", session_id, len(voice_segments)
         )
+        # 语音本身不带文字，另外把原文补进对话上下文
+        if self._get("behavior", "sync_chat_context", True):
+            await self._append_chat_context(session_id, text)
         # modified_kwargs 会整体替换宿主侧 hook 的 kwargs，故必须带上其余参数
         return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
 
@@ -924,14 +941,46 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             self.ctx.logger.error("[豆包TTS] 异常: %s", exc, exc_info=True)
             return False, b"", f"错误: {exc}"
 
-    async def _send_voice(self, audio: bytes, stream_id: str) -> bool:
-        """把音频 base64 后经 send.custom("voice") 发到会话。"""
+    async def _send_voice(self, audio: bytes, stream_id: str, text: str = "") -> bool:
+        """把音频 base64 后经 send.custom("voice") 发到会话，并把原文写回对话上下文。
+
+        只发语音是不够的：宿主 send_service 的 sync_to_maisaka_history 默认关闭，
+        且语音组件的可见文本只会渲染成「[语音消息]」，麦麦下一轮既不知道自己发过语音、
+        也不知道说了什么。这里补两件事（可用 sync_chat_context 关闭）：
+          1) processed_plain_text 让入库的语音消息带着文字（长期记忆能检索到这句话）；
+          2) maisaka.context.append 把原文写回对话历史（planner / replyer 读的就是它）。
+        """
         try:
             b64 = base64.b64encode(audio).decode("ascii")
-            return bool(await self.ctx.send.custom("voice", b64, stream_id))
+            ok = bool(
+                await self.ctx.send.custom("voice", b64, stream_id, processed_plain_text=text)
+            )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.error("[豆包TTS] 发送语音失败: %s", exc)
             return False
+
+        if ok and text and self._get("behavior", "sync_chat_context", True):
+            await self._append_chat_context(stream_id, text)
+        return ok
+
+    async def _append_chat_context(self, stream_id: str, text: str) -> None:
+        """把刚说出去的话写回麦麦的对话上下文。"""
+
+        prefix = str(self._get("behavior", "context_prefix", "") or "").strip()
+        visible = f"{prefix}{text}" if prefix else text
+        try:
+            result = await self.ctx.maisaka.context.append(
+                stream_id=stream_id,
+                segments=[{"type": "text", "data": visible}],
+                visible_text=visible,
+                source_kind="guided_reply",
+            )
+            if isinstance(result, dict) and not result.get("success", True):
+                self.ctx.logger.warning(
+                    "[豆包TTS] 同步对话上下文失败: %s", result.get("error", "未知原因")
+                )
+        except Exception as exc:  # noqa: BLE001 同步失败不该影响已经发出去的语音
+            self.ctx.logger.warning("[豆包TTS] 同步对话上下文异常: %s", exc)
 
     async def _speech(self, text: str, stream_id: str, overrides: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """把整段文本切成多条语音逐段发送。返回 (是否全部成功, 说明)。"""
@@ -947,7 +996,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             if not success:
                 self.ctx.logger.warning("[豆包TTS] 第 %d/%d 段失败: %s", i + 1, total, info)
                 continue
-            if await self._send_voice(audio, stream_id):
+            if await self._send_voice(audio, stream_id, seg):
                 ok += 1
                 last_voice = info
             await asyncio.sleep(0.35)
@@ -1088,6 +1137,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if self._get("behavior", "fallback_to_text", True):
             try:
                 await self.ctx.send.text(text, stream_id)
+                # 降级成文字时同样把原文写好上下文，行为才一致
+                if self._get("behavior", "sync_chat_context", True):
+                    await self._append_chat_context(stream_id, text)
                 return True, "语音合成失败，已改为文字回复"
             except Exception:
                 pass
