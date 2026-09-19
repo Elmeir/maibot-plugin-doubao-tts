@@ -13,6 +13,7 @@ emotion_scale = "麦麦自主" # 情感强度下拉（豆包专用）：麦麦�
 command_enabled = true       # 启用 /说 /语音 手动命令
 auto_voice_mode = "LLM 自行判断"  # 麦麦自主语音：LLM 自行判断（推荐）/ 概率触发 / 仅手动
 voice_content_source = "工具文本" # 工具语音内容来源：工具文本=LLM 传 text 直接朗读（现状）/ 回复生成=LLM 只决定用语音，内容由 reply 生成后自动转语音
+stop_planner_after_voice = true # 语音后结束本轮：成功发声即结束本轮 planner，LLM 不再补发一遍文字；关=语音照发、交给麦麦继续（「回复生成」模式不受影响）
 fallback_to_text = true      # 合成失败时降级为文字发出
 send_error_prompt = true     # 失败时提示用户
 sync_chat_context = true     # 发送语音后把原文写回麦麦对话上下文（推荐开启，麦麦才知道自己说过什么）

@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.8.0",
+  "version": "1.9.0",
   "id": "github.elmeir.doubao-tts",
   "name": "豆包·MiMo 语音TTS",
   "description": "麦麦语音回复：双引擎可切换——火山豆包语音（内置官方预置音色库，也支持复刻音色）或小米 MiMo 音色复刻（mimo-v2.5-tts-voiceclone，把 wav/mp3 音源放进插件 src/ 即可开口）。配置主页只放开关与下拉，豆包/MiMo 各一个页签改连接；新版 X-Api-Key / Bearer 鉴权。",

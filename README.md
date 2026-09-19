@@ -49,6 +49,7 @@ emotion_scale = "麦麦自主"     # 情感强度（豆包）：麦麦自主（�
 command_enabled = true        # /说 /语音 命令开关
 auto_voice_mode = "LLM 自行判断"  # 麦麦自主语音：LLM 自行判断 / 概率触发 / 仅手动
 voice_content_source = "工具文本"  # 工具语音内容来源：工具文本 / 回复生成（内容由 reply 生成后转语音）
+stop_planner_after_voice = true   # 语音后结束本轮（默认开）：语音发出即结束本轮，不再补发一遍文字；关=交给麦麦继续
 fallback_to_text = true       # 失败降级发文字
 send_error_prompt = true      # 失败时提示用户
 sync_chat_context = true      # 语音原文写回麦麦上下文（推荐开启）

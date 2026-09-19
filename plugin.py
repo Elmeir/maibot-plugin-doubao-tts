@@ -294,6 +294,19 @@ class PluginSectionConfig(PluginConfigBase):
             "hint": "工具文本=LLM 传 text 直接朗读（现状）｜回复生成=LLM 只决定用语音，说什么由 reply 生成后自动转语音",
         },
     )
+    stop_planner_after_voice: bool = Field(
+        default=True,
+        description=(
+            "语音发出后是否结束本轮 planner（结束本轮思考）。"
+            "开启（默认）：语音发送成功即结束本轮，LLM 不会再调 reply 把同样的内容发一遍文字；"
+            "关闭：语音照发，但麦麦可能继续思考并再补一条文字回复。"
+            "「工具语音内容来源=回复生成」时不受此开关影响（该模式必须继续调用 reply 生成内容）"
+        ),
+        json_schema_extra={
+            "label": "语音后结束本轮",
+            "hint": "开（推荐）=语音发出即结束本轮，不再补发文字｜关=语音照发、交给麦麦继续；「回复生成」模式不受影响",
+        },
+    )
     emotion_scale: Literal["麦麦自主", "1", "2", "3", "4", "5"] = Field(
         default="麦麦自主",
         description="情感强度 1~5（豆包专用）：麦麦自主=LLM 按情感挑档位（推荐，LLM 未给时不下发）；固定档位=1 最淡…5 最浓",
@@ -964,6 +977,17 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         except Exception:
             return "text"
         return "reply" if ("reply" in raw or "回复" in raw) else "text"
+
+    def _stop_planner_after_voice(self) -> bool:
+        """语音发出后是否结束本轮 planner（主页开关，默认开）。
+
+        开启时工具成功返回带 stop_after_execution，本批工具执行完即结束 planner；
+        关闭时语音照发、planner 继续（LLM 可能再补一条文字回复）。
+        """
+        try:
+            return bool(self._get("plugin", "stop_planner_after_voice", True))
+        except Exception:
+            return True
 
     def _is_pending_stream(self, stream_id: str) -> bool:
         """判断某会话是否处于"待语音"状态（麦麦下一条文字回复转语音）。"""
@@ -1826,17 +1850,20 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if ok:
             # stop_after_execution：语音已通过 send.custom 直发到会话，本批工具执行完
             # 即结束 planner——否则 LLM 会再调 reply 发一遍文字，内容与语音重复。
-            # 仅在成功路径停止；失败时让 LLM 自行告知用户（插件侧已发降级/错误提示的除外）。
-            return {"success": True, "message": note, "stop_after_execution": True}
+            # 主页「语音后结束本轮」开关可关掉（关闭后语音照发，麦麦可能再补一条文字）。
+            result: Dict[str, Any] = {"success": True, "message": note}
+            if self._stop_planner_after_voice():
+                result["stop_after_execution"] = True
+            return result
         # 失败路径默认不结束 planner，让 LLM 转告用户；但若插件刚给用户发过失败提示
-        # （去重窗口内），再 reply 只会与提示重复，此时同样结束 planner。
+        # （去重窗口内），再 reply 只会与提示重复，此时同样结束 planner（开关关闭时不结束）。
         msg = f"语音失败：{note}"
         if "限流" in note:
             msg += "；冷却期内重试仍会失败，请直接转告用户稍后再试，不要连续重试"
-        result: Dict[str, Any] = {"success": False, "message": msg}
-        if self._recently_prompted(stream_id):
-            result["stop_after_execution"] = True
-        return result
+        fail_result: Dict[str, Any] = {"success": False, "message": msg}
+        if self._stop_planner_after_voice() and self._recently_prompted(stream_id):
+            fail_result["stop_after_execution"] = True
+        return fail_result
 
     async def _tool_request_voice_reply(
         self, stream_id: str, overrides: Dict[str, Any]
