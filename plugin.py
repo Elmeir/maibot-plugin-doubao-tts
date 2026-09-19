@@ -29,6 +29,8 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParamType, To
 logger = logging.getLogger("plugin.doubao_tts")
 
 SUPPORTED_CONFIG_VERSION = "1.7.1"
+ERROR_PROMPT_DEDUPE_SECONDS = 30.0
+"""同一会话失败提示的去重窗口（秒）：LLM 对失败有重试倾向，去重防提示刷屏。"""
 # ─── 火山引擎 API ────────────────────────────────────────────────────────────
 DOUBAO_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 DOUBAO_RESOURCE_PRESET = "seed-tts-2.0"   # 预置音色（语音合成模型 2.0）
@@ -531,6 +533,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self._pending_voice: Dict[str, float] = {}
         # 防递归：正在发送"概率语音"的标记
         self._sending_pending_voice: bool = False
+        # 会话 → 上次失败提示时间戳（去重窗口内不再重复提示）
+        self._last_error_prompt_at: Dict[str, float] = {}
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -1048,12 +1052,28 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         await self._maybe_error(stream_id, "语音合成失败了，请稍后再试")
         return False, note
 
-    async def _maybe_error(self, stream_id: str, msg: str) -> None:
-        if self._get("behavior", "send_error_prompt", True):
-            try:
-                await self.ctx.send.text(msg, stream_id)
-            except Exception:
-                pass
+    def _recently_prompted(self, stream_id: str) -> bool:
+        """该会话最近是否已收到过失败提示（去重窗口内）。"""
+
+        last = self._last_error_prompt_at.get(stream_id)
+        return last is not None and time.time() - last < ERROR_PROMPT_DEDUPE_SECONDS
+
+    async def _maybe_error(self, stream_id: str, msg: str) -> bool:
+        """向用户发失败提示；同一会话 30 秒内只发一次，防 LLM 重试刷屏。
+
+        Returns:
+            bool: 是否真的发出了提示。
+        """
+        if not self._get("behavior", "send_error_prompt", True):
+            return False
+        if self._recently_prompted(stream_id):
+            return False
+        self._last_error_prompt_at[stream_id] = time.time()
+        try:
+            await self.ctx.send.text(msg, stream_id)
+            return True
+        except Exception:
+            return False
 
     # ── Command：手动 ───────────────────────────────────────────────────
 
