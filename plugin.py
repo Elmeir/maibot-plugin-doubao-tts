@@ -1060,7 +1060,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     @Command(
         "doubao_tts_say",
         description="用豆包语音把指定文本说出来",
-        pattern=r"(?<!\S)/(说|语音|speak)\s+(?P<text>.+)\s*$",
+        pattern=r"^/(说|语音|speak)\s+(?P<text>.+)\s*$",
     )
     async def _cmd_say(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Tuple[bool, str, bool]:
         """/说 文本 / 语音 文本 / speak 文本"""
@@ -1080,7 +1080,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     @Command(
         "doubao_tts_help",
         description="查看豆包语音帮助",
-        pattern=r"(?<!\S)/(语音帮助|说帮助|tts帮助)\s*$",
+        pattern=r"^/(语音帮助|说帮助|tts帮助)\s*$",
     )
     async def _cmd_help(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, bool]:
         """/语音帮助"""
