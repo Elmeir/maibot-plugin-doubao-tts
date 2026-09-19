@@ -629,7 +629,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def _on_before_send(self, **kwargs: Any) -> Dict[str, Any]:
-        """出站钩子：麦麦要发文字且该会话被标记"待语音" → 转语音并中止原文字。"""
+        """出站钩子：麦麦要发文字且该会话被标记"待语音" → 原地换成语音（不中止原消息）。"""
         if self._sending_pending_voice:
             return {"action": "continue"}
         message = kwargs.get("message")
@@ -654,13 +654,55 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.info("[豆包TTS] 概率语音：会话 %s 文字回复 → 语音（%d字）", session_id, len(text))
         self._sending_pending_voice = True
         try:
-            ok, note = await self._handle_speech(text, session_id, "概率语音")
-            if not ok:
-                self.ctx.logger.warning("[豆包TTS] 概率语音失败: %s（已按配置降级处理）", note)
-            # 无论成功失败，都 abort 原文字（失败已由 _handle_speech 降级为文字发出）
-            return {"action": "abort"}
+            return await self._replace_with_voice(message, text, kwargs)
         finally:
             self._sending_pending_voice = False
+
+    async def _replace_with_voice(
+        self,
+        message: Dict[str, Any],
+        text: str,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """把一条待发的文字消息原地换成语音消息（返回 Hook 结果字典）。
+
+        为什么不沿用「中止原消息 + 自己另发语音」：宿主 send_service 一旦 abort，
+        发送函数返回 None，麦麦的 reply 工具会把本轮回复判为"发送失败"并交回 planner，
+        LLM 看到失败便会重发 → 语音和文字就会反复出现。原地替换则让原消息正常走完
+        发送流程：reply 拿到成功结果、消息照常入库，一次发送就完成。
+        合成失败时返回 continue，原文照常发出，不会丢内容。
+        """
+        if not self._api_key():
+            self.ctx.logger.warning("[豆包TTS] 未配置 API Key，本条保持文字")
+            return {"action": "continue"}
+        session_id = str(message.get("session_id") or "").strip()
+        max_len = max(1, int(self._get("behavior", "max_text_length", 150) or 150))
+        # 与手动命令 / Tool 路径一致：先按配置决定是否翻译，再切分逐段合成
+        tts_text = await self._translate_if_needed(text)
+        segments = _split_sentences(tts_text, max_len)
+        if not segments:
+            return {"action": "continue"}
+        voice_segments: List[Dict[str, Any]] = []
+        for seg in segments:
+            success, audio, info = await self._synthesize_one(seg)
+            if not success or not audio:
+                self.ctx.logger.warning("[豆包TTS] 分段合成失败，整条回退为文字: %s", info)
+                return {"action": "continue"}
+            voice_segments.append({
+                "type": "voice",
+                # data 留空：可见文本只会渲染成「[语音消息]」，
+                # 不会把一长串 base64 灌进麦麦的对话上下文
+                "data": "",
+                "hash": "",
+                "binary_data_base64": base64.b64encode(audio).decode("ascii"),
+            })
+        new_message = dict(message)
+        new_message["raw_message"] = voice_segments
+        self.ctx.logger.info(
+            "[豆包TTS] 概率语音：会话 %s 已把文字回复换成 %d 条语音", session_id, len(voice_segments)
+        )
+        # modified_kwargs 会整体替换宿主侧 hook 的 kwargs，故必须带上其余参数
+        return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
 
     # ── 生命周期 ────────────────────────────────────────────────────────
 
