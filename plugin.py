@@ -681,6 +681,10 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         name="doubao_tts_probability_speak",
         description="概率模式：待语音会话的文字回复转成语音发出",
         order=HookOrder.EARLY,
+        # 本钩子内要做语音合成（一条回复可能切分成多段），宿主默认 5 秒不够：
+        # 超时会被记入插件熔断，连续超时会让本插件的钩子被停用。
+        # 显式放宽到 30 秒；真的超时也会按 ErrorPolicy.SKIP 放行，原文照发。
+        timeout_ms=30000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def _on_before_send(self, **kwargs: Any) -> Dict[str, Any]:
